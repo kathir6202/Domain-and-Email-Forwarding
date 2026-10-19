@@ -4,6 +4,20 @@ namespace SeekaHost\Forwarding;
 
 class DnsCheck
 {
+    /** True when the domain's A record points at the server (or no web IP is configured to compare). */
+    public static function pointsHere($domain, $server)
+    {
+        if (!$server || $server->web_ip === '') {
+            return true;
+        }
+        foreach ((array) @dns_get_record($domain, DNS_A) as $rec) {
+            if (isset($rec['ip']) && $rec['ip'] === $server->web_ip) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     /**
      * Records the client must have for forwarding to work, with live status.
      * @return array[] each: type, host, value, ok

@@ -26,6 +26,11 @@ class Settings
         'notify_client' => 'on',
         'notify_admin_errors' => 'on',
         'delete_on_deactivate' => '',
+        'allow_303' => 'on',
+        'allow_domain_email' => 'on',
+        'auto_forwarders' => 'on',
+        'parking_html' => '',
+        'api_enabled' => '',
     ];
 
     public static function all()
@@ -50,6 +55,12 @@ class Settings
     {
         $v = self::get($key);
         return $v === 'on' || $v === '1' || $v === 1 || $v === true || $v === 'yes';
+    }
+
+    /** Text setting saved through the WHMCS config screen (may be HTML-encoded). */
+    public static function text($key)
+    {
+        return Input::decode((string) self::get($key));
     }
 
     public static function int($key)

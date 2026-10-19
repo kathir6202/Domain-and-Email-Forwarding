@@ -5,7 +5,8 @@ namespace SeekaHost\Forwarding\Panels;
 /**
  * Plesk driver. Each forwarded domain is added as an additional domain (site)
  * inside the subscription named in "account". Uses the XML API for domains and
- * mail, the REST CLI gateway for Let's Encrypt, and FTP for files.
+ * mail, the REST CLI gateway for Let's Encrypt, and FTP (the subscription's
+ * system user) for files.
  */
 class Plesk extends AbstractPanel
 {
@@ -15,7 +16,7 @@ class Plesk extends AbstractPanel
 
     protected function defaultPort()
     {
-        return 8443;
+        return $this->server->secure ? 8443 : 8880;
     }
 
     private function authHeaders()
@@ -38,10 +39,13 @@ class Plesk extends AbstractPanel
         if ($xml === false) {
             throw new \RuntimeException('Unexpected response from Plesk: ' . substr(strip_tags($body), 0, 200));
         }
+        if (isset($xml->system->status) && (string) $xml->system->status === 'error') {
+            throw new \RuntimeException('Plesk: ' . (string) $xml->system->errtext . ' (' . (string) $xml->system->errcode . ')');
+        }
         foreach ($xml->xpath('//status') as $status) {
             if ((string) $status === 'error') {
                 $parent = $status->xpath('..');
-                $msg = $parent ? (string) $parent[0]->errtext : 'request failed';
+                $msg = $parent ? (string) $parent[0]->errtext . ' (' . (string) $parent[0]->errcode . ')' : 'request failed';
                 throw new \RuntimeException('Plesk ' . $action . ': ' . $msg);
             }
         }
@@ -67,68 +71,101 @@ class Plesk extends AbstractPanel
         return $this->webspaceId;
     }
 
-    private function siteId($domain, array $ref)
+    /**
+     * @return array|null [id, webspaceId] of a site with this name anywhere on the server
+     */
+    private function findSite($domain)
     {
-        if (!empty($ref['site_id'])) {
-            return (int) $ref['site_id'];
+        try {
+            $xml = $this->xml('<site><get><filter><name>' . self::e($domain) . '</name></filter><dataset><gen_info/></dataset></get></site>', 'site.get');
+        } catch (\RuntimeException $e) {
+            if (self::isNotFound($e->getMessage())) {
+                return null;
+            }
+            throw $e;
         }
-        $xml = $this->xml('<site><get><filter><name>' . self::e($domain) . '</name></filter><dataset><gen_info/></dataset></get></site>', 'site.get');
-        $ids = $xml->xpath('//site/get/result/id');
-        if (!$ids) {
+        $results = $xml->xpath('//site/get/result');
+        if (!$results || !isset($results[0]->id)) {
+            return null;
+        }
+        $r = $results[0];
+        $ws = isset($r->data->gen_info->{'webspace-id'}) ? (int) $r->data->gen_info->{'webspace-id'} : 0;
+        if ($ws === 0) {
+            // Older Plesk versions omit webspace-id: check membership via the subscription's site list.
+            $ws = in_array(strtolower($domain), $this->listDomains(), true) ? $this->webspaceId() : -1;
+        }
+        return [(int) $r->id, $ws];
+    }
+
+    /** Site id, guaranteed to belong to our subscription. */
+    private function ownSiteId($domain, array $ref)
+    {
+        $site = $this->findSite($domain);
+        if (!$site) {
             throw new \RuntimeException('Plesk site ' . $domain . ' was not found.');
         }
-        return (int) $ids[0];
+        if ($site[1] !== $this->webspaceId()) {
+            throw new \RuntimeException('Plesk site ' . $domain . ' belongs to another subscription; refusing to modify it.');
+        }
+        return $site[0];
     }
 
     public function testConnection()
     {
-        return 'Connected. Subscription ID: ' . $this->webspaceId();
+        $msg = 'Connected. Subscription ID: ' . $this->webspaceId();
+        $this->ftpTest();
+        return $msg . '. FTP login OK.';
+    }
+
+    public function listDomains()
+    {
+        $xml = $this->xml('<site><get><filter><parent-id>' . $this->webspaceId() . '</parent-id></filter><dataset><gen_info/></dataset></get></site>', 'site.list');
+        $names = [];
+        foreach ($xml->xpath('//site/get/result/data/gen_info/name') as $name) {
+            $names[] = (string) $name;
+        }
+        return self::normaliseDomains($names);
     }
 
     public function addDomain($domain)
     {
         $dir = self::DOCROOT_BASE . '/' . $domain;
-        try {
-            $xml = $this->xml('<site><add><gen_setup><name>' . self::e($domain) . '</name><webspace-id>'
-                . $this->webspaceId() . '</webspace-id></gen_setup><hosting><vrt_hst><property><name>www_root</name><value>'
-                . self::e($dir) . '</value></property></vrt_hst></hosting></add></site>', 'site.add');
-            $ids = $xml->xpath('//site/add/result/id');
-            $siteId = $ids ? (int) $ids[0] : $this->siteId($domain, []);
-        } catch (\RuntimeException $e) {
-            if (!self::isAlreadyExists($e->getMessage())) {
-                throw $e;
+        $site = $this->findSite($domain);
+        if ($site) {
+            if ($site[1] !== $this->webspaceId()) {
+                throw new \RuntimeException('Domain ' . $domain . ' already exists in another Plesk subscription on this server.');
             }
-            $siteId = $this->siteId($domain, []);
+            return ['site_id' => $site[0], 'dir' => $dir];
         }
-        return ['site_id' => $siteId, 'dir' => $dir];
+        $xml = $this->xml('<site><add><gen_setup><name>' . self::e($domain) . '</name><webspace-id>'
+            . $this->webspaceId() . '</webspace-id></gen_setup><hosting><vrt_hst><property><name>www_root</name><value>'
+            . self::e($dir) . '</value></property></vrt_hst></hosting></add></site>', 'site.add');
+        $ids = $xml->xpath('//site/add/result/id');
+        return ['site_id' => $ids ? (int) $ids[0] : $this->ownSiteId($domain, []), 'dir' => $dir];
     }
 
     public function removeDomain($domain, array $ref)
     {
-        $this->xml('<site><del><filter><id>' . $this->siteId($domain, $ref) . '</id></filter></del></site>', 'site.del');
+        $site = $this->findSite($domain);
+        if (!$site) {
+            return;
+        }
+        if ($site[1] !== $this->webspaceId()) {
+            throw new \RuntimeException('Plesk site ' . $domain . ' belongs to another subscription; not removing it.');
+        }
+        $this->xml('<site><del><filter><id>' . $site[0] . '</id></filter></del></site>', 'site.del');
     }
 
     public function deployFiles($domain, array $ref, array $files)
     {
-        $this->ftpUpload($ref['dir'], $files);
+        // Remove Plesk's default page so nginx can never serve it instead of the forwarding script.
+        $this->ftpUpload($ref['dir'], $files, ['index.html', 'index.htm', 'default.htm']);
     }
 
-    public function syncEmailForwarder($domain, array $ref, $local, array $old, array $new)
+    private function createMailForwarder($siteId, $local, array $dests)
     {
-        $siteId = $this->siteId($domain, $ref);
-        if ($old) {
-            try {
-                $this->xml('<mail><remove><filter><site-id>' . $siteId . '</site-id><name>' . self::e($local)
-                    . '</name></filter></remove></mail>', 'mail.remove');
-            } catch (\RuntimeException $e) {
-                // Not present on the server; continue.
-            }
-        }
-        if (!$new) {
-            return;
-        }
         $addresses = '';
-        foreach ($new as $dest) {
+        foreach ($dests as $dest) {
             $addresses .= '<address>' . self::e($dest) . '</address>';
         }
         $this->xml('<mail><create><filter><site-id>' . $siteId . '</site-id><mailname><name>' . self::e($local)
@@ -136,11 +173,43 @@ class Plesk extends AbstractPanel
             . '</forwarding></mailname></filter></create></mail>', 'mail.create');
     }
 
+    private function removeMailName($siteId, $local)
+    {
+        try {
+            $this->xml('<mail><remove><filter><site-id>' . $siteId . '</site-id><name>' . self::e($local)
+                . '</name></filter></remove></mail>', 'mail.remove');
+        } catch (\RuntimeException $e) {
+            if (!self::isNotFound($e->getMessage())) {
+                throw $e;
+            }
+        }
+    }
+
+    public function syncEmailForwarder($domain, array $ref, $local, $old, array $new)
+    {
+        $siteId = $this->ownSiteId($domain, $ref);
+        $this->removeMailName($siteId, $local);
+        if (!$new) {
+            return;
+        }
+        try {
+            $this->createMailForwarder($siteId, $local, $new);
+        } catch (\RuntimeException $e) {
+            if ($old) {
+                try {
+                    $this->createMailForwarder($siteId, $local, $old); // restore previous state
+                } catch (\RuntimeException $ignored) {
+                }
+            }
+            throw $e;
+        }
+    }
+
     public function setCatchAll($domain, array $ref, $destination)
     {
         $mode = $destination ? '<forward>' . self::e($destination) . '</forward>' : '<reject/>';
-        $this->xml('<mail><set><filter><site-id>' . $this->siteId($domain, $ref) . '</site-id><prefs><nonexistent-user>'
-            . $mode . '</nonexistent-user></prefs></filter></set></mail>', 'mail.set');
+        $this->xml('<mail><set_prefs><filter><site-id>' . $this->ownSiteId($domain, $ref) . '</site-id><prefs><nonexistent-user>'
+            . $mode . '</nonexistent-user></prefs></filter></set_prefs></mail>', 'mail.set_prefs');
     }
 
     public function requestSsl($domain, array $ref)
@@ -158,12 +227,12 @@ class Plesk extends AbstractPanel
         } else {
             $auth = $this->server->username . ':' . $this->password;
         }
-        list($code, $body) = $this->http('POST', $this->baseUrl() . '/api/v2/cli/extension/call', $headers, json_encode(['params' => $params]), $auth, 'letsencrypt');
+        list($code, $body) = $this->http('POST', $this->baseUrl() . '/api/v2/cli/extension/call', $headers, json_encode(['params' => $params]), $auth, 'letsencrypt', 300);
         $json = json_decode($body, true);
-        if ($code >= 400 || (isset($json['code']) && (int) $json['code'] !== 0)) {
+        if ($code >= 400 || (is_array($json) && isset($json['code']) && (int) $json['code'] !== 0)) {
             $msg = isset($json['stderr']) ? $json['stderr'] : (isset($json['message']) ? $json['message'] : 'HTTP ' . $code);
             throw new \RuntimeException('Plesk Let\'s Encrypt: ' . trim($msg));
         }
-        return 'issued';
+        return is_array($json) && isset($json['code']) ? 'issued' : 'requested';
     }
 }

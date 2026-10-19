@@ -10,7 +10,7 @@ class Notifier
             return;
         }
         try {
-            localAPI('SendEmail', [
+            $result = localAPI('SendEmail', [
                 'messagename' => Schema::EMAIL_TEMPLATE,
                 'id' => (int) $domainId,
                 'customvars' => base64_encode(serialize([
@@ -18,6 +18,9 @@ class Notifier
                     'fwd_details' => nl2br(htmlspecialchars($details, ENT_QUOTES, 'UTF-8')),
                 ])),
             ]);
+            if (isset($result['result']) && $result['result'] !== 'success') {
+                Logger::log('notify', 'Client email failed: ' . (isset($result['message']) ? $result['message'] : 'unknown'), 'error', null, $domainId);
+            }
         } catch (\Throwable $e) {
             Logger::log('notify', 'Client email failed: ' . $e->getMessage(), 'error', null, $domainId);
         }

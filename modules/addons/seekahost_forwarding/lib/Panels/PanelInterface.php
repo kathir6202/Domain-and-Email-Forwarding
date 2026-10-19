@@ -8,21 +8,40 @@ namespace SeekaHost\Forwarding\Panels;
  */
 interface PanelInterface
 {
+    /** @return string human readable success message */
     public function testConnection();
 
-    /** @return array reference data needed for later calls */
+    /** @return bool whether the panel supports an optional feature ("domain_email") */
+    public function supports($feature);
+
+    /** @return string[] domains currently present in the configured account */
+    public function listDomains();
+
+    /**
+     * Adds the domain to the configured account, or adopts it when it already
+     * belongs to that account. Must fail when the domain exists elsewhere.
+     * @return array reference data needed for later calls
+     */
     public function addDomain($domain);
 
+    /** Idempotent: succeeds when the domain is already gone. */
     public function removeDomain($domain, array $ref);
 
     /** @param array $files filename => content, written to the domain document root */
     public function deployFiles($domain, array $ref, array $files);
 
-    /** Replace the destinations of local@domain: $old are currently active, $new are wanted. */
-    public function syncEmailForwarder($domain, array $ref, $local, array $old, array $new);
+    /**
+     * Make local@domain forward to exactly $new.
+     * @param array|null $old destinations currently on the server, or null when unknown
+     */
+    public function syncEmailForwarder($domain, array $ref, $local, $old, array $new);
 
-    /** @param string|null $destination null disables the catch-all (bounce) */
+    /** @param string|null $destination null disables the catch-all (reject) */
     public function setCatchAll($domain, array $ref, $destination);
 
+    /** Forward all mail for $domain to the same local part at $destDomain (null removes). */
+    public function setDomainForwarder($domain, array $ref, $destDomain);
+
+    /** @return string "issued" or "requested" */
     public function requestSsl($domain, array $ref);
 }

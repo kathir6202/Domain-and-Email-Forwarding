@@ -11,6 +11,8 @@ class Schema
     const T_URL = 'mod_seekahost_forwarding_url';
     const T_EMAIL = 'mod_seekahost_forwarding_email';
     const T_LOGS = 'mod_seekahost_forwarding_logs';
+    const T_TLDS = 'mod_seekahost_forwarding_tlds';
+    const T_TOKENS = 'mod_seekahost_forwarding_api_tokens';
 
     const EMAIL_TEMPLATE = 'SeekaHost Forwarding Notification';
 
@@ -29,6 +31,7 @@ class Schema
                 $t->string('hostname', 255);
                 $t->integer('port')->nullable();
                 $t->boolean('secure')->default(1);
+                $t->boolean('verify_ssl')->default(0);
                 $t->string('username', 100)->default('');
                 $t->text('password')->nullable();
                 $t->text('api_token')->nullable();
@@ -53,14 +56,17 @@ class Schema
                 $t->increments('id');
                 $t->unsignedInteger('domain_id')->unique();
                 $t->unsignedInteger('client_id')->index();
-                $t->string('domain', 255);
-                $t->unsignedInteger('server_id')->nullable();
-                $t->string('status', 20)->default('pending');
+                $t->string('domain', 191)->index();
+                $t->unsignedInteger('server_id')->nullable()->index();
+                $t->string('status', 20)->default('pending')->index();
+                $t->boolean('parked')->default(0);
                 $t->text('remote_ref')->nullable();
                 $t->string('ssl_status', 20)->nullable();
+                $t->dateTime('ssl_requested_at')->nullable();
                 $t->integer('url_limit')->nullable();
                 $t->integer('email_limit')->nullable();
                 $t->string('catchall', 255)->nullable();
+                $t->string('domain_forward', 191)->nullable();
                 $t->text('last_error')->nullable();
                 $t->dateTime('last_sync')->nullable();
                 $t->dateTime('created_at')->nullable();
@@ -75,8 +81,10 @@ class Schema
                 $t->string('source_path', 191)->default('/');
                 $t->text('destination');
                 $t->string('type', 10)->default('301');
+                $t->string('www_mode', 10)->default('both');
                 $t->boolean('wildcard')->default(0);
                 $t->boolean('preserve_query')->default(1);
+                $t->boolean('auto')->default(0);
                 $t->string('title', 255)->nullable();
                 $t->text('meta_description')->nullable();
                 $t->text('meta_keywords')->nullable();
@@ -103,21 +111,105 @@ class Schema
                 $t->increments('id');
                 $t->unsignedInteger('client_id')->nullable()->index();
                 $t->unsignedInteger('domain_id')->nullable()->index();
-                $t->string('actor', 20)->default('system');
-                $t->string('level', 10)->default('info');
+                $t->string('actor', 64)->default('system');
+                $t->string('level', 10)->default('info')->index();
                 $t->string('action', 64);
                 $t->text('message');
                 $t->dateTime('created_at')->nullable();
             });
         }
 
+        if (!$schema->hasTable(self::T_TLDS)) {
+            $schema->create(self::T_TLDS, function ($t) {
+                $t->increments('id');
+                $t->string('tld', 64)->unique();
+                $t->boolean('allow_url')->default(1);
+                $t->boolean('allow_path')->default(1);
+                $t->boolean('allow_email')->default(1);
+                $t->boolean('allow_domain_email')->default(1);
+                $t->boolean('allow_catchall')->default(1);
+                $t->boolean('park_only')->default(0);
+                $t->string('auto_action', 10)->default('none');
+                $t->text('auto_url')->nullable();
+                $t->string('auto_type', 10)->default('301');
+                $t->dateTime('updated_at')->nullable();
+            });
+        }
+
+        if (!$schema->hasTable(self::T_TOKENS)) {
+            $schema->create(self::T_TOKENS, function ($t) {
+                $t->increments('id');
+                $t->string('name', 100);
+                $t->string('token_hash', 64)->unique();
+                $t->string('token_hint', 12)->default('');
+                $t->text('allowed_ips')->nullable();
+                $t->boolean('active')->default(1);
+                $t->dateTime('last_used_at')->nullable();
+                $t->string('last_ip', 64)->nullable();
+                $t->dateTime('created_at')->nullable();
+            });
+        }
+
+        self::migrate();
         self::installEmailTemplate();
     }
 
+    /** Columns/indexes added after 1.0.0. */
+    private static function migrate()
+    {
+        $schema = Capsule::schema();
+        $add = function ($table, $column, callable $definition) use ($schema) {
+            if (!$schema->hasColumn($table, $column)) {
+                $schema->table($table, $definition);
+            }
+        };
+        $add(self::T_SERVERS, 'verify_ssl', function ($t) {
+            $t->boolean('verify_ssl')->default(0);
+        });
+        $add(self::T_DOMAINS, 'parked', function ($t) {
+            $t->boolean('parked')->default(0);
+        });
+        $add(self::T_DOMAINS, 'ssl_requested_at', function ($t) {
+            $t->dateTime('ssl_requested_at')->nullable();
+        });
+        $add(self::T_DOMAINS, 'domain_forward', function ($t) {
+            $t->string('domain_forward', 191)->nullable();
+        });
+        $add(self::T_URL, 'www_mode', function ($t) {
+            $t->string('www_mode', 10)->default('both');
+        });
+        $add(self::T_URL, 'auto', function ($t) {
+            $t->boolean('auto')->default(0);
+        });
+
+        foreach ([[self::T_DOMAINS, 'domain'], [self::T_DOMAINS, 'status'], [self::T_DOMAINS, 'server_id'], [self::T_LOGS, 'level']] as $idx) {
+            self::ensureIndex($idx[0], $idx[1]);
+        }
+    }
+
+    private static function ensureIndex($table, $column)
+    {
+        try {
+            $prefix = Capsule::connection()->getTablePrefix();
+            $exists = Capsule::select('SHOW INDEX FROM `' . $prefix . $table . '` WHERE Column_name = ?', [$column]);
+            if (!$exists) {
+                Capsule::schema()->table($table, function ($t) use ($column) {
+                    $t->index($column);
+                });
+            }
+        } catch (\Throwable $e) {
+            // Index is an optimisation only.
+        }
+    }
+
+    /**
+     * Drops module data. Forwarded domains are NOT removed from the panel servers;
+     * use "Remove from Server" first if that is wanted.
+     */
     public static function uninstall()
     {
         $schema = Capsule::schema();
-        foreach ([self::T_LOGS, self::T_EMAIL, self::T_URL, self::T_DOMAINS, self::T_SERVERS] as $table) {
+        foreach ([self::T_TOKENS, self::T_TLDS, self::T_LOGS, self::T_EMAIL, self::T_URL, self::T_DOMAINS, self::T_SERVERS] as $table) {
             $schema->dropIfExists($table);
         }
         Capsule::table('tblemailtemplates')->where('name', self::EMAIL_TEMPLATE)->delete();

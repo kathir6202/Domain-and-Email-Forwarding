@@ -9,13 +9,20 @@ namespace SeekaHost\Forwarding\Panels;
  */
 class Cpanel extends AbstractPanel
 {
-    const DOCROOT_BASE = 'seekahost_fwd';
+    const DOCROOT_BASE = 'public_html/seekahost_fwd';
 
     private $home;
+    private $mainDomain;
+    private $forwarders = [];
 
     protected function defaultPort()
     {
         return $this->server->secure ? 2087 : 2086;
+    }
+
+    public function supports($feature)
+    {
+        return $feature === 'domain_email';
     }
 
     private function headers()
@@ -58,12 +65,17 @@ class Cpanel extends AbstractPanel
         list(, $body) = $this->http(
             'POST',
             $this->baseUrl() . '/json-api/cpanel?' . http_build_query($query),
-            $this->headers(),
+            array_merge($this->headers(), ['Content-Type: application/x-www-form-urlencoded']),
             http_build_query($params),
             null,
             $module . '::' . $function
         );
         $json = $this->decode($body);
+
+        // Errors raised by the WHM proxy itself (unknown user, permissions...).
+        if (!isset($json['result']) && !empty($json['cpanelresult']['error']) && $version == 3) {
+            throw new \RuntimeException($module . '::' . $function . ': ' . $json['cpanelresult']['error']);
+        }
 
         if ($version == 3) {
             $result = isset($json['result']) ? $json['result'] : [];
@@ -84,18 +96,21 @@ class Cpanel extends AbstractPanel
             $error = isset($result['data'][0]['reason']) ? $result['data'][0]['reason'] : 'request failed';
         }
         if ($error !== '') {
-            throw new \RuntimeException($module . '::' . $function . ': ' . $error);
+            throw new \RuntimeException($module . '::' . $function . ': ' . strip_tags($error));
         }
         return isset($result['data']) ? $result['data'] : [];
     }
 
     private function accountMainDomain()
     {
-        $data = $this->whm('accountsummary', ['user' => $this->server->account]);
-        if (empty($data['acct'][0]['domain'])) {
-            throw new \RuntimeException('cPanel account "' . $this->server->account . '" was not found.');
+        if ($this->mainDomain === null) {
+            $data = $this->whm('accountsummary', ['user' => $this->server->account]);
+            if (empty($data['acct'][0]['domain'])) {
+                throw new \RuntimeException('cPanel account "' . $this->server->account . '" was not found.');
+            }
+            $this->mainDomain = strtolower($data['acct'][0]['domain']);
         }
-        return $data['acct'][0]['domain'];
+        return $this->mainDomain;
     }
 
     private function homeDir()
@@ -114,35 +129,86 @@ class Cpanel extends AbstractPanel
         return $this->home;
     }
 
+    /** @return array domain => addon info */
+    private function addonDomains()
+    {
+        $out = [];
+        foreach ((array) $this->cpanel(2, 'AddonDomain', 'listaddondomains') as $row) {
+            if (!empty($row['domain'])) {
+                $out[strtolower($row['domain'])] = $row;
+            }
+        }
+        return $out;
+    }
+
+    /** First label of the addon's internal subdomain. */
+    private static function labelOf(array $row)
+    {
+        foreach (['fullsubdomain', 'subdomain'] as $key) {
+            if (!empty($row[$key])) {
+                $value = (string) $row[$key];
+                $dot = strpos($value, '.');
+                return $dot === false ? $value : substr($value, 0, $dot);
+            }
+        }
+        return '';
+    }
+
     public function testConnection()
     {
-        return 'Connected. Account main domain: ' . $this->accountMainDomain();
+        $msg = 'Connected. Account main domain: ' . $this->accountMainDomain();
+        $this->addonDomains();
+        return $msg . ' (addon domain API OK).';
+    }
+
+    public function listDomains()
+    {
+        return array_keys($this->addonDomains());
     }
 
     public function addDomain($domain)
     {
-        $sub = substr(preg_replace('/[^a-z0-9]/', '', strtolower($domain)), 0, 30);
-        $dir = 'public_html/' . self::DOCROOT_BASE . '/' . $domain;
-        try {
-            $this->cpanel(2, 'AddonDomain', 'addaddondomain', [
-                'newdomain' => $domain,
-                'subdomain' => $sub,
-                'dir' => $dir,
-            ]);
-        } catch (\RuntimeException $e) {
-            if (!self::isAlreadyExists($e->getMessage())) {
-                throw $e;
-            }
+        $existing = $this->addonDomains();
+        $main = $this->accountMainDomain();
+        if (isset($existing[$domain])) {
+            $row = $existing[$domain];
+            $dir = isset($row['reldir']) ? preg_replace('#^home:/?#', '', $row['reldir']) : self::DOCROOT_BASE . '/' . $domain;
+            return ['sub' => self::labelOf($row) ?: 'x', 'dir' => $dir, 'main' => $main];
         }
-        return ['sub' => $sub, 'dir' => $dir, 'main' => $this->accountMainDomain()];
+
+        // Unique label: readable prefix + hash, so different domains never collide.
+        $sub = substr(preg_replace('/[^a-z0-9]/', '', $domain), 0, 20) . substr(md5($domain), 0, 6);
+        $dir = self::DOCROOT_BASE . '/' . $domain;
+        $this->cpanel(2, 'AddonDomain', 'addaddondomain', [
+            'newdomain' => $domain,
+            'subdomain' => $sub,
+            'dir' => $dir,
+        ]);
+        $this->protectBaseDir();
+        return ['sub' => $sub, 'dir' => $dir, 'main' => $main];
+    }
+
+    /** Stop directory listing of the folder holding every forwarded docroot. */
+    private function protectBaseDir()
+    {
+        try {
+            $dir = $this->homeDir() . '/' . self::DOCROOT_BASE;
+            $this->cpanel(3, 'Fileman', 'save_file_content', ['dir' => $dir, 'file' => 'index.html', 'content' => '']);
+        } catch (\RuntimeException $e) {
+            // Cosmetic hardening only.
+        }
     }
 
     public function removeDomain($domain, array $ref)
     {
-        $main = !empty($ref['main']) ? $ref['main'] : $this->accountMainDomain();
+        $existing = $this->addonDomains();
+        if (!isset($existing[$domain])) {
+            return;
+        }
+        $label = self::labelOf($existing[$domain]) ?: (isset($ref['sub']) ? $ref['sub'] : '');
         $this->cpanel(2, 'AddonDomain', 'deladdondomain', [
             'domain' => $domain,
-            'subdomain' => $ref['sub'] . '_' . $main,
+            'subdomain' => $label . '_' . $this->accountMainDomain(),
         ]);
     }
 
@@ -158,24 +224,45 @@ class Cpanel extends AbstractPanel
         }
     }
 
-    public function syncEmailForwarder($domain, array $ref, $local, array $old, array $new)
+    /** @return string[] current destinations of $address on the server */
+    private function serverForwarders($domain, $address)
     {
-        $address = $local . '@' . $domain;
-        foreach (array_diff($old, $new) as $dest) {
-            try {
-                $this->cpanel(3, 'Email', 'delete_forwarder', ['address' => $address, 'forwarder' => $dest]);
-            } catch (\RuntimeException $e) {
-                // Already gone on the server; nothing to remove.
+        if (!isset($this->forwarders[$domain])) {
+            $this->forwarders[$domain] = [];
+            foreach ((array) $this->cpanel(3, 'Email', 'list_forwarders', ['domain' => $domain]) as $row) {
+                if (isset($row['dest'], $row['forward'])) {
+                    $this->forwarders[$domain][strtolower($row['dest'])][] = strtolower($row['forward']);
+                }
             }
         }
+        return isset($this->forwarders[$domain][$address]) ? $this->forwarders[$domain][$address] : [];
+    }
+
+    public function syncEmailForwarder($domain, array $ref, $local, $old, array $new)
+    {
+        $address = $local . '@' . $domain;
+        if ($old === null) {
+            $old = $this->serverForwarders($domain, $address);
+        }
+        // Add first, then remove, so a failure never leaves the alias without a destination.
         foreach (array_diff($new, $old) as $dest) {
             $this->cpanel(3, 'Email', 'add_forwarder', [
                 'domain' => $domain,
-                'email' => $local,
+                'email' => $address,
                 'fwdopt' => 'fwd',
                 'fwdemail' => $dest,
             ]);
         }
+        foreach (array_diff($old, $new) as $dest) {
+            try {
+                $this->cpanel(3, 'Email', 'delete_forwarder', ['address' => $address, 'forwarder' => $dest]);
+            } catch (\RuntimeException $e) {
+                if (!self::isNotFound($e->getMessage())) {
+                    throw $e;
+                }
+            }
+        }
+        unset($this->forwarders[$domain]);
     }
 
     public function setCatchAll($domain, array $ref, $destination)
@@ -191,10 +278,33 @@ class Cpanel extends AbstractPanel
         $this->cpanel(3, 'Email', 'set_default_address', $params);
     }
 
+    public function setDomainForwarder($domain, array $ref, $destDomain)
+    {
+        $current = null;
+        foreach ((array) $this->cpanel(3, 'Email', 'list_domain_forwarders', ['domain' => $domain]) as $row) {
+            if (isset($row['forward'])) {
+                $current = strtolower($row['forward']);
+            }
+        }
+        if ($current === $destDomain) {
+            return;
+        }
+        if ($current !== null) {
+            $this->cpanel(3, 'Email', 'delete_domain_forwarder', ['domain' => $domain]);
+        }
+        if ($destDomain) {
+            $this->cpanel(3, 'Email', 'add_domain_forwarder', ['domain' => $domain, 'destdomain' => $destDomain]);
+        }
+    }
+
     public function requestSsl($domain, array $ref)
     {
-        // AutoSSL covers addon domains; trigger a check for the account now.
-        $this->whm('start_autossl_check_for_one_user', ['username' => $this->server->account]);
+        // AutoSSL covers addon domains. The cPanel-level call works for reseller credentials too.
+        try {
+            $this->cpanel(3, 'SSL', 'start_autossl_check');
+        } catch (\RuntimeException $e) {
+            $this->whm('start_autossl_check_for_one_user', ['username' => $this->server->account]);
+        }
         return 'requested';
     }
 }

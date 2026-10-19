@@ -3,12 +3,16 @@
 namespace SeekaHost\Forwarding\Client;
 
 use SeekaHost\Forwarding\DnsCheck;
+use SeekaHost\Forwarding\Input;
 use SeekaHost\Forwarding\Service;
 use SeekaHost\Forwarding\Settings;
+use SeekaHost\Forwarding\Validator;
 use WHMCS\Database\Capsule;
 
 class ClientController
 {
+    const SSL_THROTTLE_SECONDS = 3600;
+
     private $vars;
     private $link;
 
@@ -29,6 +33,18 @@ class ClientController
         return isset($_SESSION['uid']) ? (int) $_SESSION['uid'] : 0;
     }
 
+    /** WHMCS user/contact permission to manage domains (account owners always pass). */
+    private static function canManageDomains()
+    {
+        if (!function_exists('checkContactPermission') && defined('ROOTDIR') && is_file(ROOTDIR . '/includes/clientareafunctions.php')) {
+            require_once ROOTDIR . '/includes/clientareafunctions.php';
+        }
+        if (function_exists('checkContactPermission')) {
+            return (bool) checkContactPermission('managedomains', true);
+        }
+        return true;
+    }
+
     private function page($title, array $vars, $breadcrumb = [])
     {
         $flash = isset($_SESSION['shfwd_flash']) ? $_SESSION['shfwd_flash'] : null;
@@ -45,14 +61,16 @@ class ClientController
                 'flash' => $flash,
                 'mode' => 'manage',
                 'error' => null,
+                'addonsLink' => null,
+                'domainId' => null,
             ], $vars),
         ];
     }
 
-    private function redirect($domainId, $type, $message)
+    private function redirect($domainId, $type, $message, $extra = '')
     {
         $_SESSION['shfwd_flash'] = ['type' => $type, 'message' => $message];
-        header('Location: ' . $this->link . '&id=' . (int) $domainId);
+        header('Location: ' . $this->link . '&id=' . (int) $domainId . $extra);
         exit;
     }
 
@@ -61,6 +79,9 @@ class ClientController
         $clientId = self::clientId();
         if (!$clientId) {
             return $this->page('Domain & Email Forwarding', ['mode' => 'error']);
+        }
+        if (!self::canManageDomains()) {
+            return $this->page('Domain & Email Forwarding', ['mode' => 'error', 'error' => 'You do not have permission to manage domains on this account.']);
         }
 
         $domainId = isset($_REQUEST['id']) ? (int) $_REQUEST['id'] : 0;
@@ -73,18 +94,14 @@ class ClientController
             return $this->page('Domain & Email Forwarding', ['mode' => 'error', 'error' => 'Domain not found.']);
         }
 
-        list($eligible, $reason) = Service::eligibility($domainRow);
-        if ($eligible && Settings::on('hide_if_hosting') && Service::hasHosting($domainRow)) {
-            $eligible = false;
-            $reason = 'This domain has a hosting service with us. Please manage forwarding from your hosting control panel.';
-        }
-        if (!$eligible) {
+        list($ok, $reason, $code) = Service::access($domainRow);
+        if (!$ok) {
             return $this->page('Domain & Email Forwarding', [
                 'mode' => 'error',
                 'error' => $reason,
-                'domain' => $domainRow->domain,
+                'domain' => Validator::toUnicode($domainRow->domain),
                 'domainId' => $domainId,
-                'addonsLink' => 'clientarea.php?action=domainaddons&id=' . $domainId,
+                'addonsLink' => $code === 'addon' ? 'clientarea.php?action=domainaddons&id=' . $domainId : null,
             ], ['clientarea.php?action=domaindetails&id=' . $domainId => $domainRow->domain]);
         }
 
@@ -94,18 +111,26 @@ class ClientController
             $this->handlePost($fwd, $domainId);
         }
 
-        return $this->manage($fwd, $domainRow);
+        return $this->manage($fwd);
     }
 
     private function handlePost($fwd, $domainId)
     {
         check_token('WHMCS.default');
-        $action = isset($_POST['a']) ? $_POST['a'] : '';
-        $id = isset($_POST['fid']) ? (int) $_POST['fid'] : null;
+        $in = Input::all();
+        $action = isset($in['a']) ? $in['a'] : '';
+        $id = !empty($in['fid']) ? (int) $in['fid'] : null;
+        $back = '';
+        if ($id && $action === 'save_url') {
+            $back = '&edit_url=' . $id . '#shfwd-url-form';
+        } elseif ($id && $action === 'save_email') {
+            $back = '&edit_email=' . $id . '#shfwd-email-form';
+        }
+        $msg = null;
         try {
             switch ($action) {
                 case 'save_url':
-                    Service::saveUrl($fwd, $_POST, $id);
+                    Service::saveUrl($fwd, $in, $id);
                     $msg = 'URL forwarder saved.';
                     break;
                 case 'delete_url':
@@ -113,7 +138,7 @@ class ClientController
                     $msg = 'URL forwarder deleted.';
                     break;
                 case 'save_email':
-                    Service::saveEmail($fwd, $_POST, $id);
+                    Service::saveEmail($fwd, $in, $id);
                     $msg = 'Email forwarder saved.';
                     break;
                 case 'delete_email':
@@ -121,36 +146,42 @@ class ClientController
                     $msg = 'Email forwarder deleted.';
                     break;
                 case 'catchall':
-                    Service::setCatchAll($fwd, isset($_POST['catchall']) ? $_POST['catchall'] : '');
+                    Service::setCatchAll($fwd, isset($in['catchall']) ? $in['catchall'] : '');
                     $msg = 'Catch-all updated.';
                     break;
+                case 'domain_forward':
+                    Service::setDomainForwarder($fwd, isset($in['domain_forward']) ? $in['domain_forward'] : '');
+                    $msg = 'Domain email forwarding updated.';
+                    break;
                 case 'ssl':
+                    if ($fwd->ssl_requested_at && time() - strtotime($fwd->ssl_requested_at) < self::SSL_THROTTLE_SECONDS) {
+                        Validator::fail('An SSL certificate was requested recently. Please wait an hour before trying again.');
+                    }
                     $fwd = Service::ensureProvisioned($fwd);
-                    Service::requestSsl($fwd);
+                    Service::requestSsl($fwd, true);
                     $msg = 'SSL certificate requested. It can take a few minutes to become active.';
                     break;
-                default:
-                    $msg = null;
             }
         } catch (\InvalidArgumentException $e) {
-            $this->redirect($domainId, 'error', $e->getMessage());
+            $this->redirect($domainId, 'error', $e->getMessage(), $back);
         } catch (\Throwable $e) {
             $this->redirect($domainId, 'error', $action === 'ssl'
                 ? 'The SSL certificate could not be issued yet. Please make sure the DNS records below point to our server and try again later.'
-                : 'We could not apply this change right now. Our team has been notified; please try again later.');
+                : 'We could not apply this change right now. Our team has been notified; please try again later.', $back);
         }
         if ($msg) {
             $this->redirect($domainId, 'success', $msg);
         }
     }
 
-    private function manage($fwd, $domainRow)
+    private function manage($fwd)
     {
+        $policy = Service::policy($fwd);
         $urls = Service::urls($fwd);
         $emails = Service::emails($fwd);
         foreach ($emails as $e) {
             $e->dest_list = Service::splitDestinations($e->destinations);
-            $e->dest_text = implode(", ", $e->dest_list);
+            $e->dest_text = implode(', ', $e->dest_list);
         }
 
         $editUrl = null;
@@ -171,39 +202,46 @@ class ClientController
         }
 
         $types = Service::URL_TYPES;
-        if (!Settings::on('allow_302')) {
-            unset($types['302']);
-        }
-        if (!Settings::on('allow_masked')) {
-            unset($types['masked']);
+        foreach (['302' => 'allow_302', '303' => 'allow_303', 'masked' => 'allow_masked'] as $type => $setting) {
+            if (!Settings::on($setting)) {
+                unset($types[$type]);
+            }
         }
 
-        $server = Service::server($fwd);
+        $server = Service::server($fwd, $fwd->status !== 'active');
         $limits = Service::limits($fwd);
+        $display = Validator::toUnicode($fwd->domain);
 
-        return $this->page('Domain & Email Forwarding - ' . $fwd->domain, [
-            'domain' => $fwd->domain,
+        return $this->page('Domain & Email Forwarding - ' . $display, [
+            'domain' => $display,
             'domainId' => $fwd->domain_id,
             'status' => $fwd->status,
             'sslStatus' => $fwd->ssl_status,
             'urls' => $urls,
             'emails' => $emails,
             'catchall' => $fwd->catchall,
+            'domainForward' => $fwd->domain_forward,
             'urlLimit' => $limits['url'],
             'emailLimit' => $limits['email'],
             'urlCount' => count($urls),
             'emailCount' => count($emails),
             'types' => $types,
-            'allowPath' => Settings::on('allow_path'),
-            'allowWildcard' => Settings::on('allow_wildcard'),
-            'allowCatchall' => Settings::on('allow_catchall'),
+            'wwwModes' => Service::WWW_MODES,
+            'allowUrl' => $policy['url'],
+            'allowPath' => $policy['path'],
+            'allowWildcard' => $policy['wildcard'],
+            'allowEmail' => $policy['email'],
+            'allowCatchall' => $policy['catchall'],
+            'allowDomainEmail' => $policy['domain_email'] && $server && Service::supportsDomainEmail($fwd),
+            'parkOnly' => $policy['park_only'],
+            'disabled' => $fwd->status === 'disabled',
             'maxDestinations' => Settings::int('max_destinations'),
             'dns' => Settings::on('show_dns') ? DnsCheck::records($fwd->domain, $server) : [],
             'serverReady' => (bool) $server,
             'editUrl' => $editUrl,
             'editEmail' => $editEmail,
         ], [
-            'clientarea.php?action=domaindetails&id=' . $fwd->domain_id => $fwd->domain,
+            'clientarea.php?action=domaindetails&id=' . $fwd->domain_id => $display,
             $this->link . '&id=' . $fwd->domain_id => 'Forwarding',
         ]);
     }
@@ -214,7 +252,7 @@ class ClientController
         $domains = [];
         foreach ($rows as $row) {
             if (Service::visibleToClient($row)) {
-                $domains[] = ['id' => $row->id, 'domain' => $row->domain];
+                $domains[] = ['id' => $row->id, 'domain' => Validator::toUnicode($row->domain)];
             }
         }
         return $this->page('Domain & Email Forwarding', ['mode' => 'list', 'domains' => $domains]);

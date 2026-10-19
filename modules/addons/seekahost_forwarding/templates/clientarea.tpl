@@ -1,4 +1,5 @@
-{* SeekaHost Domain & Email Forwarding - client area (Bootstrap markup, Lagom compatible) *}
+{* SeekaHost Domain & Email Forwarding - client area (Bootstrap markup, Lagom / Six / Twenty-One compatible) *}
+{literal}
 <style>
 .shfwd .shfwd-box{border:1px solid rgba(0,0,0,.1);border-radius:6px;padding:20px;margin-bottom:24px;background:#fff}
 .shfwd .shfwd-box h3{margin-top:0;font-size:18px}
@@ -9,7 +10,12 @@
 .shfwd table td,.shfwd table th{vertical-align:middle!important}
 .shfwd .shfwd-inline{display:inline}
 .shfwd .shfwd-masked{display:none}
+.shfwd .shfwd-check{display:inline-block;margin-right:20px;font-weight:normal}
+.shfwd .shfwd-addon{display:flex}
+.shfwd .shfwd-addon .shfwd-addon-text{display:flex;align-items:center;padding:0 10px;background:#f5f5f5;border:1px solid #ccc;white-space:nowrap}
+.shfwd .shfwd-addon .form-control{flex:1 1 auto;min-width:0}
 </style>
+{/literal}
 
 <div class="shfwd">
 
@@ -20,7 +26,7 @@
 {if $mode eq 'error'}
     <div class="alert alert-warning">{if $error}{$error|escape}{else}Please log in to continue.{/if}</div>
     {if $addonsLink}<a href="{$addonsLink}" class="btn btn-primary">View Domain Addons</a>{/if}
-    {if $domainId}<a href="clientarea.php?action=domaindetails&id={$domainId}" class="btn btn-default">Back to Domain</a>{/if}
+    {if $domainId}<a href="clientarea.php?action=domaindetails&id={$domainId}" class="btn btn-default btn-secondary">Back to Domain</a>{/if}
 
 {elseif $mode eq 'list'}
     <div class="shfwd-box">
@@ -43,8 +49,15 @@
     {if !$serverReady}
         <div class="alert alert-warning">Forwarding is being set up for our platform. Please try again later.</div>
     {/if}
+    {if $disabled}
+        <div class="alert alert-warning">Forwarding for this domain has been disabled by our team. Please contact support.</div>
+    {/if}
+    {if $parkOnly}
+        <div class="alert alert-info">This domain is parked with us. Forwarding options are not available for this domain extension.</div>
+    {/if}
 
     {* ---------------------------------------------------------------- URL *}
+    {if $allowUrl}
     <div class="shfwd-box">
         <h3>Domain (URL) Forwarding <span class="shfwd-muted">{$urlCount}{if $urlLimit} / {$urlLimit}{/if} used</span></h3>
 
@@ -57,13 +70,14 @@
                 <tr>
                     <td>{$domain|escape}{$u->source_path|escape}</td>
                     <td style="word-break:break-all">{$u->destination|escape}</td>
-                    <td>{$types[$u->type]|default:$u->type|escape}</td>
+                    <td>{if isset($types[$u->type])}{$types[$u->type]|escape}{else}{$u->type|escape}{/if}</td>
                     <td>
                         {if $u->wildcard}<span class="shfwd-badge">Wildcard</span>{/if}
                         {if $u->preserve_query}<span class="shfwd-badge">Keep query</span>{/if}
+                        {if $u->www_mode neq 'both'}<span class="shfwd-badge">{$wwwModes[$u->www_mode]|escape}</span>{/if}
                     </td>
                     <td class="text-right" style="white-space:nowrap">
-                        <a class="btn btn-default btn-sm" href="{$modulelink}&id={$domainId}&edit_url={$u->id}#shfwd-url-form">Edit</a>
+                        <a class="btn btn-default btn-secondary btn-sm" href="{$modulelink}&id={$domainId}&edit_url={$u->id}#shfwd-url-form">Edit</a>
                         <form method="post" action="{$modulelink}&id={$domainId}" class="shfwd-inline" onsubmit="return confirm('Delete this forwarder?');">
                             <input type="hidden" name="token" value="{$token}">
                             <input type="hidden" name="a" value="delete_url">
@@ -80,7 +94,7 @@
             <p class="shfwd-muted">No URL forwarders yet.</p>
         {/if}
 
-        {if $editUrl || !$urlLimit || $urlCount < $urlLimit}
+        {if !$disabled && ($editUrl || !$urlLimit || $urlCount < $urlLimit)}
         <h4 id="shfwd-url-form">{if $editUrl}Edit URL Forwarder{else}Add URL Forwarder{/if}</h4>
         <form method="post" action="{$modulelink}&id={$domainId}">
             <input type="hidden" name="token" value="{$token}">
@@ -89,8 +103,8 @@
             <div class="row">
                 <div class="col-sm-4 form-group">
                     <label>Source</label>
-                    <div class="input-group">
-                        <span class="input-group-addon input-group-text">{$domain|escape}</span>
+                    <div class="shfwd-addon">
+                        <span class="shfwd-addon-text">{$domain|escape}</span>
                         <input type="text" name="source_path" class="form-control" value="{if $editUrl}{$editUrl->source_path|escape}{else}/{/if}" {if !$allowPath}readonly{/if} placeholder="/">
                     </div>
                     <span class="shfwd-muted">Use "/" for the whole domain{if $allowPath}, or a path such as /blog{/if}.</span>
@@ -108,17 +122,27 @@
                     </select>
                 </div>
             </div>
-            <div class="form-group">
-                {if $allowWildcard}
-                <label class="checkbox-inline" style="margin-right:20px">
-                    <input type="checkbox" name="wildcard" value="1" {if $editUrl && $editUrl->wildcard}checked{/if}>
-                    Wildcard (forward sub-paths, e.g. /page &rarr; destination/page)
-                </label>
-                {/if}
-                <label class="checkbox-inline">
-                    <input type="checkbox" name="preserve_query" value="1" {if !$editUrl || $editUrl->preserve_query}checked{/if}>
-                    Keep query string
-                </label>
+            <div class="row">
+                <div class="col-sm-4 form-group">
+                    <label>www. Handling</label>
+                    <select name="www_mode" class="form-control">
+                        {foreach $wwwModes as $k => $label}
+                            <option value="{$k}" {if $editUrl && $editUrl->www_mode eq $k}selected{/if}>{$label}</option>
+                        {/foreach}
+                    </select>
+                </div>
+                <div class="col-sm-8 form-group" style="padding-top:28px">
+                    {if $allowWildcard}
+                    <label class="shfwd-check">
+                        <input type="checkbox" name="wildcard" value="1" {if $editUrl && $editUrl->wildcard}checked{/if}>
+                        Wildcard (forward sub-paths, e.g. /page &rarr; destination/page)
+                    </label>
+                    {/if}
+                    <label class="shfwd-check">
+                        <input type="checkbox" name="preserve_query" value="1" {if !$editUrl || $editUrl->preserve_query}checked{/if}>
+                        Keep query string
+                    </label>
+                </div>
             </div>
             <div class="shfwd-masked" id="shfwd-masked">
                 <div class="row">
@@ -126,19 +150,21 @@
                     <div class="col-sm-4 form-group"><label>Meta Description</label><input type="text" name="meta_description" class="form-control" value="{if $editUrl}{$editUrl->meta_description|escape}{/if}"></div>
                     <div class="col-sm-4 form-group"><label>Meta Keywords</label><input type="text" name="meta_keywords" class="form-control" value="{if $editUrl}{$editUrl->meta_keywords|escape}{/if}"></div>
                 </div>
-                <p class="shfwd-muted">Masked forwarding keeps your domain in the address bar. Some sites refuse to be displayed in a frame.</p>
+                <p class="shfwd-muted">Masked forwarding keeps your domain in the address bar. Use an https:// destination, and note that some sites refuse to be displayed in a frame.</p>
             </div>
             <button type="submit" class="btn btn-primary">{if $editUrl}Save Changes{else}Add Forwarder{/if}</button>
-            {if $editUrl}<a href="{$modulelink}&id={$domainId}" class="btn btn-default">Cancel</a>{/if}
+            {if $editUrl}<a href="{$modulelink}&id={$domainId}" class="btn btn-default btn-secondary">Cancel</a>{/if}
         </form>
-        {else}
+        {elseif !$disabled}
             <p class="shfwd-muted">You have reached the URL forwarder limit for this domain.</p>
         {/if}
     </div>
+    {/if}
 
     {* -------------------------------------------------------------- Email *}
+    {if $allowEmail || $allowCatchall || $allowDomainEmail || $emails || $catchall || $domainForward}
     <div class="shfwd-box">
-        <h3>Email Forwarding <span class="shfwd-muted">{$emailCount}{if $emailLimit} / {$emailLimit}{/if} used</span></h3>
+        <h3>Email Forwarding{if $allowEmail} <span class="shfwd-muted">{$emailCount}{if $emailLimit} / {$emailLimit}{/if} used</span>{/if}</h3>
 
         {if $emails}
         <div class="table-responsive">
@@ -150,7 +176,7 @@
                     <td>{$e->local_part|escape}@{$domain|escape}</td>
                     <td>{foreach $e->dest_list as $dest}{$dest|escape}<br>{/foreach}</td>
                     <td class="text-right" style="white-space:nowrap">
-                        <a class="btn btn-default btn-sm" href="{$modulelink}&id={$domainId}&edit_email={$e->id}#shfwd-email-form">Edit</a>
+                        {if $allowEmail}<a class="btn btn-default btn-secondary btn-sm" href="{$modulelink}&id={$domainId}&edit_email={$e->id}#shfwd-email-form">Edit</a>{/if}
                         <form method="post" action="{$modulelink}&id={$domainId}" class="shfwd-inline" onsubmit="return confirm('Delete this email forwarder?');">
                             <input type="hidden" name="token" value="{$token}">
                             <input type="hidden" name="a" value="delete_email">
@@ -163,10 +189,11 @@
             </tbody>
         </table>
         </div>
-        {else}
+        {elseif $allowEmail}
             <p class="shfwd-muted">No email forwarders yet.</p>
         {/if}
 
+        {if $allowEmail && !$disabled}
         {if $editEmail || !$emailLimit || $emailCount < $emailLimit}
         <h4 id="shfwd-email-form">{if $editEmail}Edit Email Forwarder{else}Add Email Forwarder{/if}</h4>
         <form method="post" action="{$modulelink}&id={$domainId}">
@@ -176,36 +203,50 @@
             <div class="row">
                 <div class="col-sm-5 form-group">
                     <label>Alias</label>
-                    <div class="input-group">
+                    <div class="shfwd-addon">
                         <input type="text" name="local_part" class="form-control" required value="{if $editEmail}{$editEmail->local_part|escape}{/if}" {if $editEmail}readonly{/if} placeholder="info">
-                        <span class="input-group-addon input-group-text">@{$domain|escape}</span>
+                        <span class="shfwd-addon-text">@{$domain|escape}</span>
                     </div>
                 </div>
                 <div class="col-sm-7 form-group">
                     <label>Forward To</label>
                     <input type="text" name="destinations" class="form-control" required value="{if $editEmail}{$editEmail->dest_text|escape}{/if}" placeholder="you@gmail.com, team@example.com">
-                    <span class="shfwd-muted">Separate multiple addresses with commas (max {$maxDestinations}).</span>
+                    <span class="shfwd-muted">Separate multiple addresses with commas{if $maxDestinations} (max {$maxDestinations}){/if}.</span>
                 </div>
             </div>
             <button type="submit" class="btn btn-primary">{if $editEmail}Save Changes{else}Add Forwarder{/if}</button>
-            {if $editEmail}<a href="{$modulelink}&id={$domainId}" class="btn btn-default">Cancel</a>{/if}
+            {if $editEmail}<a href="{$modulelink}&id={$domainId}" class="btn btn-default btn-secondary">Cancel</a>{/if}
         </form>
         {else}
             <p class="shfwd-muted">You have reached the email forwarder limit for this domain.</p>
         {/if}
+        {/if}
 
-        {if $allowCatchall}
+        {if ($allowCatchall || $catchall) && !$disabled}
         <hr>
         <h4>Catch-All</h4>
-        <p class="shfwd-muted">Forward email sent to any other address at {$domain|escape}. Leave empty to reject unknown addresses.</p>
+        <p class="shfwd-muted">Forward email sent to any other address at {$domain|escape} to one mailbox. Leave empty to reject unknown addresses.</p>
         <form method="post" action="{$modulelink}&id={$domainId}" class="form-inline">
             <input type="hidden" name="token" value="{$token}">
             <input type="hidden" name="a" value="catchall">
-            <input type="email" name="catchall" class="form-control" style="min-width:280px" value="{$catchall|escape}" placeholder="you@example.com">
-            <button type="submit" class="btn btn-primary">Save</button>
+            <input type="text" name="catchall" class="form-control" style="min-width:280px" value="{$catchall|escape}" placeholder="you@example.com" {if !$allowCatchall}readonly{/if}>
+            <button type="submit" class="btn btn-primary" {if !$allowCatchall}onclick="this.form.catchall.value='';"{/if}>{if $allowCatchall}Save{else}Remove{/if}</button>
+        </form>
+        {/if}
+
+        {if ($allowDomainEmail || $domainForward) && !$disabled}
+        <hr>
+        <h4>Domain Email Forwarding</h4>
+        <p class="shfwd-muted">Forward all email for {$domain|escape} to the same address at another domain (e.g. anything@{$domain|escape} &rarr; anything@example.com). Leave empty to disable.</p>
+        <form method="post" action="{$modulelink}&id={$domainId}" class="form-inline">
+            <input type="hidden" name="token" value="{$token}">
+            <input type="hidden" name="a" value="domain_forward">
+            <input type="text" name="domain_forward" class="form-control" style="min-width:280px" value="{$domainForward|escape}" placeholder="example.com" {if !$allowDomainEmail}readonly{/if}>
+            <button type="submit" class="btn btn-primary" {if !$allowDomainEmail}onclick="this.form.domain_forward.value='';"{/if}>{if $allowDomainEmail}Save{else}Remove{/if}</button>
         </form>
         {/if}
     </div>
+    {/if}
 
     {* ---------------------------------------------------------- DNS / SSL *}
     {if $dns}
@@ -239,20 +280,23 @@
         <form method="post" action="{$modulelink}&id={$domainId}">
             <input type="hidden" name="token" value="{$token}">
             <input type="hidden" name="a" value="ssl">
-            <button type="submit" class="btn btn-default">Request SSL Certificate</button>
+            <button type="submit" class="btn btn-default btn-secondary">Request SSL Certificate</button>
         </form>
     </div>
     {/if}
 
-    <a href="clientarea.php?action=domaindetails&id={$domainId}" class="btn btn-default">Back to Domain</a>
+    <a href="clientarea.php?action=domaindetails&id={$domainId}" class="btn btn-default btn-secondary">Back to Domain</a>
 
+    {literal}
     <script>
     (function () {
         var sel = document.getElementById('shfwd-type'), box = document.getElementById('shfwd-masked');
-        if (!sel || !box) return;
+        if (!sel || !box) { return; }
         function toggle() { box.style.display = sel.value === 'masked' ? 'block' : 'none'; }
-        sel.addEventListener('change', toggle); toggle();
+        sel.addEventListener('change', toggle);
+        toggle();
     })();
     </script>
+    {/literal}
 {/if}
 </div>

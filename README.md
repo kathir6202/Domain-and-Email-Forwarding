@@ -2,32 +2,98 @@
 
 Domain (URL) and email forwarding for domains registered or transferred to you. The forwarding itself runs on a **cPanel/WHM**, **DirectAdmin** or **Plesk** server.
 
-Tested against the WHMCS 8.13.x and 9.0.x module APIs, on PHP 7.4 – 8.3.
+Supports WHMCS 8.13.x and 9.0.x on PHP 7.4 – 8.3. The client area works with the Lagom, Six and Twenty-One themes.
 
 ## Features
 
-- **URL forwarding:** 301 and 302 redirects, masked/frame forwarding (with page title, meta description and keywords), path forwarding (`/blog` → URL), wildcard (sub-path) forwarding, and an option to keep the query string.
-- **HTTPS:** Let's Encrypt or AutoSSL is requested automatically and retried daily until it is issued.
-- **Email forwarding:** aliases with multiple destinations, catch-all, per-domain limits, and a limit on destinations per alias.
-- **Client area:** a management page that works with the Lagom theme, a sidebar link on each domain, a live DNS record check, and an email notification to the client on every change.
-- **Admin area:** a dashboard, the domain/forwarder list (searchable by domain or client ID), per-domain limit overrides, Sync, Request SSL, Remove from server, Delete, server management with a connection test, and activity logs. Server API calls also go to the WHMCS module log.
-- **Billing:** uses WHMCS's native **Email Forwarding domain addon**. Clients tick it when they register or transfer a domain, or add it later. WHMCS handles pricing, renewals and the admin toggle natively.
-- **Lifecycle:** a daily cron job removes domains from the server when they expire or the addon is removed, and restores them when the domain becomes eligible again. Deleted domains are cleaned up.
+### Domain (URL) forwarding
+- 301 (permanent), 302 (temporary) and 303 (see other) redirects, plus **masked/frame** forwarding with page title, meta description and keywords.
+- Whole-domain forwarding, or **directory/path** forwarding (for example `/blog` → URL).
+- **Wildcard** forwarding: `/page` goes to `destination/page`.
+- **www. handling:** with or without `www.`, only with `www.`, or only without `www.`.
+- An option to keep the query string. Destination `#fragments` are kept, and international destination domains are supported.
+- **Parking:** a configurable parking page for domains that have no URL forwarders.
+- HTTPS through AutoSSL or Let's Encrypt. It is requested automatically, retried daily once the A record points to the server, and clients can request it themselves (at most once an hour).
+
+### Email forwarding
+- Aliases with several destinations. No mailboxes are created.
+- **Catch-all**, which forwards unknown addresses to one mailbox.
+- **Domain email forwarding** (cPanel only): `anything@a.com` → `anything@b.com`.
+- Per-domain limits and a limit on destinations per alias.
+- Every new forwarded domain gets a "reject unknown addresses" catch-all, so mail is never delivered to the shared hosting account.
+
+### Client area
+- A management page that opens from the domain sidebar and from a box on the domain details page.
+- It can optionally replace the native WHMCS email forwarding page.
+- Shows the required DNS records (A and MX) with live status.
+- Respects WHMCS user permissions: a user needs the "Manage Domains" permission.
+- Displays international (IDN) domain names correctly.
+- Emails the client on every change, using the `SeekaHost Forwarding Notification` email template.
+
+### Admin area
+- **Dashboard** with statistics, error alerts and recent activity.
+- **Domains & Forwarders:**
+  - search by domain, client name, email or ID, and filter by status or server
+  - per-domain management: forwarders, limit overrides, server choice, **Sync to Server**, **Check Server**, **Park/Unpark**, **Request SSL**, **Remove from Server & Disable**, and **Delete** (with a force option)
+- **Servers:** cPanel/WHM, DirectAdmin and Plesk, with a connection test that covers the API and FTP, and SSL certificate verification.
+- **TLD Settings:** per-TLD permissions (URL, directory, email, domain-email and catch-all forwarders, or **park only**) and an **automatic action** after registration or transfer (park, or create a URL forwarder to a URL containing `{domain}`).
+- **API:** token management with IP and CIDR restrictions.
+- **Logs:** filter by level and by actor (admin, client, system, api). Server API calls are also written to the WHMCS module log.
+
+### Automation
+- After a domain is **registered or transferred**, the TLD's automatic action runs. It can be switched off globally.
+- **Daily cron:**
+  - removes domains from the server when they stop qualifying (expired, cancelled, addon removed, or a hosting service was added)
+  - restores them when they qualify again
+  - retries failed operations
+  - removes domains that no longer have any forwarders
+  - restores domains that disappeared from the server
+  - retries SSL
+- When a **hosting account** is created for a forwarded domain, the domain is first released from the forwarding server.
+- When a domain **moves to another client**, the previous owner's forwarders are wiped.
+- When a domain is **deleted** in WHMCS, it is removed from the server.
+
+### API
+- Endpoint: `https://YOUR-WHMCS/modules/addons/seekahost_forwarding/api.php`
+- Requests use GET or POST. Send the token in the `X-API-Token` header (or a `token` parameter). Responses are JSON.
+
+| action | parameters |
+|---|---|
+| `domains` | `client_id` |
+| `redirects` | `domain_id` or `domain` |
+| `redirect_create` / `redirect_update` | `domain_id`/`domain`, (`id`), `source_path`, `destination`, `type` (301/302/303/masked), `www_mode` (both/www/nowww), `wildcard`, `preserve_query`, `title`, `meta_description`, `meta_keywords` |
+| `redirect_delete` | `domain_id`/`domain`, `id` |
+| `email_forwarders` | `domain_id`/`domain` |
+| `email_forwarder_create` / `email_forwarder_update` | `domain_id`/`domain`, (`id`), `local_part`, `destinations` (comma-separated or an array) |
+| `email_forwarder_delete` | `domain_id`/`domain`, `id` |
+| `catchall_set` | `domain_id`/`domain`, `destination` (empty disables it) |
+
+Example:
+
+```bash
+curl -H "X-API-Token: shfwd_..." \
+  "https://billing.example.com/modules/addons/seekahost_forwarding/api.php?action=redirect_create&domain=example.com&source_path=/&destination=https://example.org"
+```
 
 ## Why it is safe across WHMCS updates
 
 - Everything lives in `modules/addons/seekahost_forwarding/`. No WHMCS core files or theme templates are changed.
-- It uses only its own database tables (`mod_seekahost_forwarding_*`) and one email template of its own.
+- It uses only its own tables (`mod_seekahost_forwarding_*`) and one email template of its own. Schema upgrades run automatically and can be repeated safely.
 - It integrates through documented hooks, the addon module API and `localAPI`.
-- Every hook is wrapped in error handling, so a module or server failure can never break WHMCS pages or cron.
+- Every hook is wrapped in error handling, so a module or server failure can never break WHMCS pages, checkout or cron.
 
 ## Installation
 
 1. Download `dist/seekahost_forwarding.zip`.
 2. Extract it into your WHMCS root folder. It creates `modules/addons/seekahost_forwarding/`.
 3. In WHMCS go to **System Settings → Addon Modules**. Find **SeekaHost Domain & Email Forwarding**, then click **Activate** and **Configure**.
-4. Grant access to the admin role groups that should manage it, and review the settings (limits, allowed types, access mode).
+4. Grant access to the admin role groups that should manage it, and review the settings.
 5. Open **Addons → SeekaHost Domain & Email Forwarding → Servers → Add Server**, save, then click **Test**.
+6. Optional:
+   - In **TLD Settings**, restrict features per TLD or set up automatic parking or forwarding.
+   - In **API**, create tokens, after first enabling the API in the module settings.
+
+**Upgrading:** upload the new files over the old ones. WHMCS runs the module's upgrade step automatically.
 
 ### Offering it as a domain addon (Access Mode = "Domain addon required")
 
@@ -42,52 +108,41 @@ Tested against the WHMCS 8.13.x and 9.0.x module APIs, on PHP 7.4 – 8.3.
 $_LANG['domainemailforwarding'] = 'Domain & Email Forwarding';
 ```
 
-Lagom may use its own language keys. If the label doesn't change, check Lagom's language override documentation.
-
 ## Preparing the forwarding server
 
-Each server needs **one dedicated hosting account**. Every forwarded domain is added to that account.
+Each server needs **one dedicated hosting account**. Every forwarded domain is added to that account. The web server must run **Apache or LiteSpeed** with `.htaccess` and PHP enabled. Plesk's default nginx-in-front-of-Apache setup is fine; nginx-only is not supported.
 
-| Panel | "Account" field | Credentials | File upload |
+| Panel | "Account" field | Credentials | Files |
 |---|---|---|---|
 | cPanel/WHM | the cPanel username | WHM user (root or reseller) + **API token** (recommended) | cPanel API (no FTP needed) |
-| DirectAdmin | the DirectAdmin username | admin/reseller login (`admin\|user` login-as) or the user itself, password or login key | FTP (the user's FTP login) |
-| Plesk | the subscription (webspace) domain | Plesk admin + password or secret key | FTP (the subscription's system user) |
+| DirectAdmin | the DirectAdmin username | admin/reseller login (`admin\|user` login-as) or the user itself, with a password or login key | FTP with **the user's FTP password** |
+| Plesk | the subscription (webspace) domain | Plesk admin + password, or a secret key | FTP with **the subscription's system user** |
 
-### cPanel/WHM
+- **cPanel:**
+  - Give the account's package unlimited addon domains.
+  - Allow remote and unregistered domains in **WHM → Tweak Settings** as needed.
+  - Keep AutoSSL enabled.
+  - Document roots go to `public_html/seekahost_fwd/<domain>`.
+- **DirectAdmin:**
+  - The user's package must allow unlimited domains, and Let's Encrypt must be enabled.
+  - Files are deployed to both `public_html` and `private_html`.
+- **Plesk:**
+  - The subscription's plan must allow enough additional domains and have PHP enabled.
+  - Install the **Let's Encrypt** extension.
+  - Optionally set **Let's Encrypt Email** in the module settings.
+- **Connection settings:** turn on **FTP over TLS** and **Verify SSL Certificate** whenever your servers support them. Both are on by default for new servers.
+- **DNS:** **Web IP** and **Mail Host** are shown to clients as the A and MX records their domain needs. Clients set these in your DNS Management.
 
-- Use a dedicated account, for example `fwdhost`, with nothing in its own website. The forwarded domains' document roots are `public_html/seekahost_fwd/<domain>`.
-- Give the account's package unlimited addon domains.
-- In **WHM → Tweak Settings**, allow remote domains and unregistered domains as needed.
-- Keep AutoSSL enabled.
+## Domain status
 
-### DirectAdmin
-
-- The user's package must allow unlimited domains, and Let's Encrypt must be enabled.
-- FTP must be reachable from the WHMCS server.
-
-### Plesk
-
-- The subscription needs enough additional domains in its service plan.
-- Install and enable the **Let's Encrypt** extension.
-- FTP must be reachable from the WHMCS server.
-- Optionally set **Let's Encrypt Email** in the module settings.
-
-### Fields used for every panel
-
-- **Web IP** and **Mail Host** are shown to clients as the A and MX records their domain needs. Clients set these in your DNS Management.
-
-## How forwarding works
-
-- When a client adds their first forwarder, the domain is added to the forwarding server.
-- URL rules are compiled into a small `index.php` and `.htaccess` in that domain's document root, so the same features work on all three panels. ACME `/.well-known/` requests are left alone so SSL can be issued.
-- Email forwarders and the catch-all use each panel's native email forwarding.
-- The catch-all supports one destination address, because of a limitation in the panels.
-
-## Moving from development to production
-
-Upload the same zip to production, activate the module, add the servers and set up domain pricing. Nothing is version-specific between WHMCS 8.13 and 9.0.
+| Status | Meaning |
+|---|---|
+| pending | Not on a server, because nothing is configured yet. |
+| active | On the server, with every rule applied. |
+| error | A step failed. The domain is retried by the daily cron or by **Sync to Server**. |
+| suspended | Removed automatically because it no longer qualifies (expired, addon removed, hosting added). It is restored automatically. |
+| disabled | Removed by an admin. Only **Sync to Server** restores it. |
 
 ## Uninstall
 
-Deactivate the module. By default the data is kept. Enable **Delete Data on Deactivate** first if you want the tables and email template removed.
+Deactivate the module. By default the data is kept. If you enable **Delete Data on Deactivate**, tables are dropped, but domains are **not** removed from the servers. Use **Remove from Server** first if you want them removed.

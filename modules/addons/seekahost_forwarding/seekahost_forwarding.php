@@ -69,10 +69,29 @@ function seekahost_forwarding_config()
                 'Default' => '5',
             ],
             'allow_302' => ['FriendlyName' => 'Allow 302 (Temporary)', 'Type' => 'yesno', 'Default' => 'on'],
+            'allow_303' => ['FriendlyName' => 'Allow 303 (See Other)', 'Type' => 'yesno', 'Default' => 'on'],
             'allow_masked' => ['FriendlyName' => 'Allow Masked (Frame) Forwarding', 'Type' => 'yesno', 'Default' => 'on'],
             'allow_path' => ['FriendlyName' => 'Allow Path Forwarding', 'Type' => 'yesno', 'Default' => 'on'],
             'allow_wildcard' => ['FriendlyName' => 'Allow Wildcard Forwarding', 'Type' => 'yesno', 'Default' => 'on'],
             'allow_catchall' => ['FriendlyName' => 'Allow Catch-All Email', 'Type' => 'yesno', 'Default' => 'on'],
+            'allow_domain_email' => [
+                'FriendlyName' => 'Allow Domain Email Forwarding',
+                'Type' => 'yesno',
+                'Default' => 'on',
+                'Description' => 'Forward all mail of a domain to the same address at another domain (cPanel servers only).',
+            ],
+            'auto_forwarders' => [
+                'FriendlyName' => 'Automatic Forwarders',
+                'Type' => 'yesno',
+                'Default' => 'on',
+                'Description' => 'Run the per-TLD automatic action (park / create forwarder) after registration or transfer.',
+            ],
+            'parking_html' => [
+                'FriendlyName' => 'Parking Page HTML',
+                'Type' => 'textarea',
+                'Rows' => '4',
+                'Description' => 'Shown for parked domains without URL forwarders. {domain} is replaced. Empty = built-in page.',
+            ],
             'auto_ssl' => [
                 'FriendlyName' => 'Auto Request SSL (Let\'s Encrypt)',
                 'Type' => 'yesno',
@@ -92,10 +111,15 @@ function seekahost_forwarding_config()
             ],
             'notify_client' => ['FriendlyName' => 'Email Client on Changes', 'Type' => 'yesno', 'Default' => 'on'],
             'notify_admin_errors' => ['FriendlyName' => 'Email Admins on Errors', 'Type' => 'yesno', 'Default' => 'on'],
+            'api_enabled' => [
+                'FriendlyName' => 'Enable API',
+                'Type' => 'yesno',
+                'Description' => 'Allow token-authenticated API access (manage tokens under Addons &gt; this module &gt; API).',
+            ],
             'delete_on_deactivate' => [
                 'FriendlyName' => 'Delete Data on Deactivate',
                 'Type' => 'yesno',
-                'Description' => 'Drop module tables and email template when the module is deactivated.',
+                'Description' => 'Drop module tables and email template when the module is deactivated. Domains are NOT removed from the servers.',
             ],
         ],
     ];
@@ -126,7 +150,11 @@ function seekahost_forwarding_deactivate()
 
 function seekahost_forwarding_upgrade($vars)
 {
-    Schema::install();
+    try {
+        Schema::install();
+    } catch (\Throwable $e) {
+        \SeekaHost\Forwarding\Logger::log('upgrade', 'Schema upgrade failed: ' . $e->getMessage(), 'error', null, null, 'system');
+    }
 }
 
 function seekahost_forwarding_output($vars)
