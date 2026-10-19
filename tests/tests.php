@@ -230,4 +230,80 @@ throws(function () use ($tok) { Api::authenticate($tok, '10.0.0.1'); }, SeekaHos
 ok(count(array_filter($GLOBALS['localapi'], function ($c) { return $c[0] === 'SendEmail'; })) > 0, 'client notifications');
 ok(count(array_filter($GLOBALS['localapi'], function ($c) { return $c[0] === 'SendAdminEmail'; })) > 0, 'admin error notifications');
 
+
+// ================= regression tests for the final review =================
+setting('api_enabled', 'on');
+Capsule::table('tbldomains')->insert(['id' => 30, 'userid' => 1, 'domain' => 'owner.com', 'status' => 'Active', 'emailforwarding' => 1]);
+$f = Service::fwdDomain(Service::domainRow(30));
+Service::saveEmail($f, ['local_part' => 'info', 'destinations' => 'old@gmail.com']);
+Service::setDomainForwarder(fwdOf(30), 'old-owner.com');
+// owner change while server is down: nothing changes, previous owner's rules stay known
+Capsule::table('tbldomains')->where('id', 30)->update(['userid' => 2]);
+FakePanel::$fail['removeDomain'] = 'timeout';
+throws(function () { Service::fwdDomain(Service::domainRow(30)); }, RuntimeException::class, 'owner reset blocked while server down');
+ok((int) fwdOf(30)->client_id === 1 && Capsule::table(Schema::T_EMAIL)->where('fwd_domain_id', fwdOf(30)->id)->exists(), 'owner reset left data intact');
+unset(FakePanel::$fail['removeDomain']);
+Service::cron();
+ok((int) fwdOf(30)->client_id === 2 && !isset(FakePanel::$domains['owner.com']), 'cron completes owner reset once server is back');
+
+// delete while in error state still removes from server
+Capsule::table('tbldomains')->insert(['id' => 31, 'userid' => 1, 'domain' => 'err.com', 'status' => 'Active', 'emailforwarding' => 1]);
+$f = Service::fwdDomain(Service::domainRow(31));
+Service::saveEmail($f, ['local_part' => 'info', 'destinations' => 'a@gmail.com']);
+Service::saveEmail(fwdOf(31), ['local_part' => 'keep', 'destinations' => 'k@gmail.com']);
+Capsule::table(Schema::T_DOMAINS)->where('domain_id', 31)->update(['status' => 'error']);
+Service::deleteEmail(fwdOf(31), Capsule::table(Schema::T_EMAIL)->where('fwd_domain_id', fwdOf(31)->id)->where('local_part', 'info')->value('id'));
+ok(!isset(FakePanel::$domains['err.com']['mail']['info']), 'delete in error state reaches server');
+// clearing domain forwarder in error state is reconciled
+Service::setDomainForwarder(fwdOf(31), 'x.org');
+Capsule::table(Schema::T_DOMAINS)->where('domain_id', 31)->update(['status' => 'error']);
+Service::setDomainForwarder(fwdOf(31), '');
+Service::sync(fwdOf(31));
+ok(FakePanel::$domains['err.com']['dfwd'] === null, 'cleared domain forwarder removed on sync');
+
+// partial email failure: server reconciled to stored state
+class PartialPanel extends FakePanel {
+    public function syncEmailForwarder($d, array $ref, $local, $old, array $new) {
+        if ($old !== null && in_array('bob@gmail.com', $new, true)) {
+            FakePanel::$domains[$d]['mail'][$local] = array_values(array_unique(array_merge($old, $new)));
+            throw new RuntimeException('delete failed');
+        }
+        parent::syncEmailForwarder($d, $ref, $local, $old, $new);
+    }
+}
+PanelFactory::$factory = function ($s) { return new PartialPanel(); };
+Service::saveEmail(fwdOf(31), ['local_part' => 'al', 'destinations' => 'alice@gmail.com']);
+$id = Capsule::table(Schema::T_EMAIL)->where('fwd_domain_id', fwdOf(31)->id)->where('local_part', 'al')->value('id');
+throws(function () use ($id) { Service::saveEmail(fwdOf(31), ['destinations' => 'bob@gmail.com'], $id); }, RuntimeException::class, 'partial email failure');
+ok(FakePanel::$domains['err.com']['mail']['al'] === ['alice@gmail.com'], 'server restored after partial failure');
+PanelFactory::$factory = function ($s) { return new FakePanel(); };
+
+// loop check is case-insensitive; wildcard switch off strips wildcard on deploy
+throws(function () { Service::saveUrl(fwdOf(31), ['source_path' => '/Shop', 'destination' => 'https://err.com/shop']); }, InvalidArgumentException::class, 'case-insensitive loop', 'loop');
+Service::saveUrl(fwdOf(31), ['source_path' => '/', 'destination' => 'https://w.com', 'wildcard' => 1]);
+setting('allow_wildcard', '');
+Service::deployWeb(fwdOf(31));
+$payload = base64_decode(preg_replace('/.*\$rules = json_decode\(base64_decode\(\'([^\']+)\'\).*/s', '$1', FakePanel::$domains['err.com']['files']['index.php']));
+ok(strpos($payload, '"w":false') !== false && strpos($payload, '"w":true') === false, 'wildcard disabled on deploy');
+setting('allow_wildcard', 'on');
+
+// API: update keeps omitted fields; strict CIDR; hosting respected
+$rid = Capsule::table(Schema::T_URL)->where('fwd_domain_id', fwdOf(31)->id)->where('source_path', '/')->value('id');
+Service::saveUrl(fwdOf(31), ['source_path' => '/', 'destination' => 'https://w.com', 'type' => '302', 'wildcard' => 1, 'www_mode' => 'www'], $rid);
+Api::handle('redirect_update', ['domain_id' => 31, 'id' => $rid, 'destination' => 'https://w2.com']);
+$u = Capsule::table(Schema::T_URL)->where('id', $rid)->first();
+ok($u->destination === 'https://w2.com' && $u->type === '302' && $u->wildcard == 1 && $u->www_mode === 'www', 'api update keeps omitted fields');
+Api::handle('redirect_update', ['domain_id' => 31, 'id' => $rid, 'wildcard' => 'false']);
+ok(Capsule::table(Schema::T_URL)->where('id', $rid)->value('wildcard') == 0, 'api boolean parsing');
+throws(function () { Api::createToken('bad', '1.2.3.4/'); }, InvalidArgumentException::class, 'malformed cidr rejected');
+throws(function () { Api::createToken('bad', '/x'); }, InvalidArgumentException::class, 'malformed cidr rejected 2');
+ok(!Api::ipAllowed('8.8.8.8', '1.2.3.4/') && !Api::ipAllowed('8.8.8.8', '1.2.3.4/abc') && !Api::ipAllowed('8.8.8.8', '1.2.3.4/33'), 'malformed rules deny');
+throws(function () { Api::handle('redirects', ['domain' => 'hosted.com']); }, SeekaHost\Forwarding\ApiException::class, 'api respects hide-if-hosting');
+
+// park-only TLD with forward action parks; with none does nothing
+Tld::save(['.org' => ['park_only' => 1, 'auto_action' => 'forward', 'auto_url' => 'https://l.example/']]); tldReset();
+Capsule::table('tbldomains')->insert(['id' => 32, 'userid' => 1, 'domain' => 'po.org', 'status' => 'Active', 'emailforwarding' => 1]);
+Service::autoSetup(32);
+ok(fwdOf(32) && fwdOf(32)->parked == 1, 'park-only + forward action parks');
+
 echo "PASS $pass FAIL $fail\n";

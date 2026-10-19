@@ -127,7 +127,10 @@ $shfwdAutoSetup = function ($vars) {
     }
 };
 add_hook('AfterRegistrarRegistration', 1, $shfwdAutoSetup);
-add_hook('AfterRegistrarTransfer', 1, $shfwdAutoSetup);
+// Transfers: AfterRegistrarTransfer fires while the domain is still "Pending Transfer", so act on completion.
+add_hook('DomainTransferCompleted', 1, function ($vars) use ($shfwdAutoSetup) {
+    $shfwdAutoSetup(['params' => ['domainid' => isset($vars['domainId']) ? $vars['domainId'] : (isset($vars['domainid']) ? $vars['domainid'] : 0)]]);
+});
 
 // A hosting account is about to be created for a forwarded domain: free the domain on the forwarding server.
 add_hook('PreModuleCreate', 1, function ($vars) {

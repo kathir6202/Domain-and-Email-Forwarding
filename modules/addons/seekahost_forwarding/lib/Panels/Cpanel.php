@@ -205,11 +205,15 @@ class Cpanel extends AbstractPanel
         if (!isset($existing[$domain])) {
             return;
         }
-        $label = self::labelOf($existing[$domain]) ?: (isset($ref['sub']) ? $ref['sub'] : '');
-        $this->cpanel(2, 'AddonDomain', 'deladdondomain', [
-            'domain' => $domain,
-            'subdomain' => $label . '_' . $this->accountMainDomain(),
-        ]);
+        $row = $existing[$domain];
+        if (!empty($row['domainkey'])) {
+            $key = $row['domainkey'];
+        } elseif (!empty($row['subdomain']) && !empty($row['rootdomain'])) {
+            $key = $row['subdomain'] . '_' . $row['rootdomain'];
+        } else {
+            $key = (self::labelOf($row) ?: (isset($ref['sub']) ? $ref['sub'] : '')) . '_' . $this->accountMainDomain();
+        }
+        $this->cpanel(2, 'AddonDomain', 'deladdondomain', ['domain' => $domain, 'subdomain' => $key]);
     }
 
     public function deployFiles($domain, array $ref, array $files)

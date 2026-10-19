@@ -13,6 +13,7 @@ class Plesk extends AbstractPanel
     const DOCROOT_BASE = 'seekahost_fwd';
 
     private $webspaceId;
+    private $lastWwwRoot;
 
     protected function defaultPort()
     {
@@ -77,7 +78,8 @@ class Plesk extends AbstractPanel
     private function findSite($domain)
     {
         try {
-            $xml = $this->xml('<site><get><filter><name>' . self::e($domain) . '</name></filter><dataset><gen_info/></dataset></get></site>', 'site.get');
+            $xml = $this->xml('<site><get><filter><name>' . self::e(\SeekaHost\Forwarding\Validator::toUnicode($domain))
+                . '</name></filter><dataset><gen_info/><hosting/></dataset></get></site>', 'site.get');
         } catch (\RuntimeException $e) {
             if (self::isNotFound($e->getMessage())) {
                 return null;
@@ -89,6 +91,12 @@ class Plesk extends AbstractPanel
             return null;
         }
         $r = $results[0];
+        $this->lastWwwRoot = null;
+        foreach ($r->xpath('data/hosting/vrt_hst/property') as $prop) {
+            if ((string) $prop->name === 'www_root') {
+                $this->lastWwwRoot = (string) $prop->value;
+            }
+        }
         $ws = isset($r->data->gen_info->{'webspace-id'}) ? (int) $r->data->gen_info->{'webspace-id'} : 0;
         if ($ws === 0) {
             // Older Plesk versions omit webspace-id: check membership via the subscription's site list.
@@ -121,8 +129,9 @@ class Plesk extends AbstractPanel
     {
         $xml = $this->xml('<site><get><filter><parent-id>' . $this->webspaceId() . '</parent-id></filter><dataset><gen_info/></dataset></get></site>', 'site.list');
         $names = [];
-        foreach ($xml->xpath('//site/get/result/data/gen_info/name') as $name) {
-            $names[] = (string) $name;
+        foreach ($xml->xpath('//site/get/result/data/gen_info') as $gi) {
+            $ascii = isset($gi->{'ascii-name'}) ? (string) $gi->{'ascii-name'} : '';
+            $names[] = $ascii !== '' ? $ascii : \SeekaHost\Forwarding\Validator::toAscii((string) $gi->name);
         }
         return self::normaliseDomains($names);
     }
@@ -135,13 +144,31 @@ class Plesk extends AbstractPanel
             if ($site[1] !== $this->webspaceId()) {
                 throw new \RuntimeException('Domain ' . $domain . ' already exists in another Plesk subscription on this server.');
             }
-            return ['site_id' => $site[0], 'dir' => $dir];
+            return ['site_id' => $site[0], 'dir' => $this->relativeDocroot($this->lastWwwRoot, $dir)];
         }
         $xml = $this->xml('<site><add><gen_setup><name>' . self::e($domain) . '</name><webspace-id>'
             . $this->webspaceId() . '</webspace-id></gen_setup><hosting><vrt_hst><property><name>www_root</name><value>'
             . self::e($dir) . '</value></property></vrt_hst></hosting></add></site>', 'site.add');
         $ids = $xml->xpath('//site/add/result/id');
         return ['site_id' => $ids ? (int) $ids[0] : $this->ownSiteId($domain, []), 'dir' => $dir];
+    }
+
+    /** Document root of an adopted site, relative to the subscription (FTP) root. */
+    private function relativeDocroot($wwwRoot, $fallback)
+    {
+        $wwwRoot = rtrim(str_replace('\\', '/', (string) $wwwRoot), '/');
+        if ($wwwRoot === '') {
+            return $fallback;
+        }
+        if (substr($wwwRoot, -strlen($fallback)) === $fallback) {
+            return $fallback;
+        }
+        $marker = '/' . $this->server->account . '/';
+        $pos = strpos($wwwRoot, $marker);
+        if ($pos !== false) {
+            return substr($wwwRoot, $pos + strlen($marker));
+        }
+        return $wwwRoot[0] === '/' ? $fallback : $wwwRoot;
     }
 
     public function removeDomain($domain, array $ref)
@@ -208,8 +235,8 @@ class Plesk extends AbstractPanel
     public function setCatchAll($domain, array $ref, $destination)
     {
         $mode = $destination ? '<forward>' . self::e($destination) . '</forward>' : '<reject/>';
-        $this->xml('<mail><set_prefs><filter><site-id>' . $this->ownSiteId($domain, $ref) . '</site-id><prefs><nonexistent-user>'
-            . $mode . '</nonexistent-user></prefs></filter></set_prefs></mail>', 'mail.set_prefs');
+        $this->xml('<mail><set_prefs><filter><site-id>' . $this->ownSiteId($domain, $ref) . '</site-id></filter><prefs><nonexistent-user>'
+            . $mode . '</nonexistent-user></prefs></set_prefs></mail>', 'mail.set_prefs');
     }
 
     public function requestSsl($domain, array $ref)

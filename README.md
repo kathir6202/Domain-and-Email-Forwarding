@@ -41,7 +41,7 @@ Supports WHMCS 8.13.x and 9.0.x on PHP 7.4 – 8.3. The client area works with t
 - **Logs:** filter by level and by actor (admin, client, system, api). Server API calls are also written to the WHMCS module log.
 
 ### Automation
-- After a domain is **registered or transferred**, the TLD's automatic action runs. It can be switched off globally.
+- After a domain is **registered**, or when a **transfer completes**, the TLD's automatic action runs. It can be switched off globally.
 - **Daily cron:**
   - removes domains from the server when they stop qualifying (expired, cancelled, addon removed, or a hosting service was added)
   - restores them when they qualify again
@@ -55,7 +55,9 @@ Supports WHMCS 8.13.x and 9.0.x on PHP 7.4 – 8.3. The client area works with t
 
 ### API
 - Endpoint: `https://YOUR-WHMCS/modules/addons/seekahost_forwarding/api.php`
-- Requests use GET or POST. Send the token in the `X-API-Token` header (or a `token` parameter). Responses are JSON.
+- Requests use GET or POST. Send the token in the `X-API-Token` header, or in a `token` **POST** field. Tokens in the URL are rejected. Responses are JSON.
+- IP restrictions accept single addresses and CIDR ranges (IPv4 and IPv6). If WHMCS sits behind a proxy or load balancer, configure WHMCS **Trusted Proxies** so the real client IP is used.
+- On `redirect_update` and `email_forwarder_update`, fields you leave out keep their current values.
 
 | action | parameters |
 |---|---|

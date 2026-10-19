@@ -3,7 +3,8 @@
  * SeekaHost Domain & Email Forwarding - JSON API endpoint.
  *
  *   GET/POST https://your-whmcs/modules/addons/seekahost_forwarding/api.php?action=redirects&domain=example.com
- *   Header:  X-API-Token: shfwd_...
+ *   Header:  X-API-Token: shfwd_...   (or a POST field "token"; never in the URL)
+ *   Behind a proxy/load balancer, configure WHMCS > Settings > General > Security > Trusted Proxies.
  */
 
 require_once __DIR__ . '/../../../init.php';
@@ -30,8 +31,16 @@ try {
         throw new ApiException('Module is not active.', 404);
     }
     $params = Input::decode(array_merge($_GET, $_POST));
-    $ip = isset($_SERVER['REMOTE_ADDR']) ? $_SERVER['REMOTE_ADDR'] : '';
-    $token = isset($_SERVER['HTTP_X_API_TOKEN']) ? $_SERVER['HTTP_X_API_TOKEN'] : (isset($params['token']) ? $params['token'] : '');
+    // Client IP as resolved by WHMCS (honours its Trusted Proxies setting).
+    $ip = '';
+    if (class_exists('\WHMCS\Utility\Environment\CurrentUser') && method_exists('\WHMCS\Utility\Environment\CurrentUser', 'getIP')) {
+        $ip = (string) \WHMCS\Utility\Environment\CurrentUser::getIP();
+    }
+    if ($ip === '') {
+        $ip = isset($_SERVER['REMOTE_ADDR']) ? $_SERVER['REMOTE_ADDR'] : '';
+    }
+    // Tokens are accepted from the header or a POST field only, never from the URL (logs, history).
+    $token = isset($_SERVER['HTTP_X_API_TOKEN']) ? $_SERVER['HTTP_X_API_TOKEN'] : (isset($_POST['token']) ? Input::decode($_POST['token']) : '');
     $tokenRow = Api::authenticate($token, $ip);
     unset($params['token']);
 

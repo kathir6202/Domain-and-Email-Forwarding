@@ -157,6 +157,18 @@ class Service
         return [$server, PanelFactory::make($server)];
     }
 
+    /** The domain exists on a server (fully or partially configured). */
+    public static function isPlaced($fwd)
+    {
+        return in_array($fwd->status, ['active', 'error'], true) && !empty($fwd->remote_ref);
+    }
+
+    /** Flag for a full re-sync by cron / admin Sync after a partial server change. */
+    private static function markError($fwd, $message)
+    {
+        self::touch($fwd, ['status' => 'error', 'last_error' => substr($message, 0, 2000)]);
+    }
+
     private static function ref($fwd)
     {
         return $fwd->remote_ref ? (json_decode($fwd->remote_ref, true) ?: []) : [];
@@ -190,7 +202,7 @@ class Service
      */
     public static function provision($fwd)
     {
-        list($server, $panel) = self::panelFor($fwd, $fwd->status !== 'active');
+        list($server, $panel) = self::panelFor($fwd, !self::isPlaced($fwd) && $fwd->status !== 'active');
         try {
             $ref = self::remote($fwd, 'provision', function () use ($panel, $fwd) {
                 return $panel->addDomain($fwd->domain);
@@ -227,9 +239,9 @@ class Service
                 $panel->syncEmailForwarder($fwd->domain, $ref, $row->local_part, null, $dests);
             });
         }
-        if ($fwd->domain_forward && $panel->supports('domain_email')) {
+        if ($panel->supports('domain_email')) {
             self::remote($fwd, 'sync_domain_forward', function () use ($panel, $fwd, $ref) {
-                $panel->setDomainForwarder($fwd->domain, $ref, $fwd->domain_forward);
+                $panel->setDomainForwarder($fwd->domain, $ref, $fwd->domain_forward ?: null);
             });
         }
         if ($fwd->catchall) {
@@ -272,9 +284,17 @@ class Service
         }
         $ref = $ref === null ? self::ref($fwd) : $ref;
         $policy = self::policy($fwd);
-        $rules = array_filter(self::urls($fwd), function ($r) use ($policy) {
-            return $policy['url'] && ($r->source_path === '/' || $policy['path']);
-        });
+        $rules = [];
+        foreach (self::urls($fwd) as $r) {
+            if (!$policy['url'] || ($r->source_path !== '/' && !$policy['path'])) {
+                continue;
+            }
+            if ($r->wildcard && !$policy['wildcard']) {
+                $r = clone $r;
+                $r->wildcard = 0;
+            }
+            $rules[] = $r;
+        }
         $files = Generator::build($fwd->domain, $rules, Settings::text('parking_html'));
         self::remote($fwd, 'deploy_web', function () use ($panel, $fwd, $ref, $files) {
             $panel->deployFiles($fwd->domain, $ref, $files);
@@ -298,6 +318,16 @@ class Service
                 } catch (\Throwable $e) {
                     // Removing the domain below cleans up anyway.
                 }
+            }
+            try {
+                if ($fwd->domain_forward && $panel->supports('domain_email')) {
+                    $panel->setDomainForwarder($fwd->domain, $ref, null);
+                }
+                if ($fwd->catchall) {
+                    $panel->setCatchAll($fwd->domain, $ref, null);
+                }
+            } catch (\Throwable $e) {
+                // Best effort; the domain itself is removed below.
             }
             self::remote($fwd, 'unprovision', function () use ($panel, $fwd, $ref) {
                 $panel->removeDomain($fwd->domain, $ref);
@@ -333,13 +363,17 @@ class Service
         Logger::log('purge', $fwd->domain . ' forwarding data deleted' . ($force ? ' (forced)' : ''), 'info', $fwd->client_id, $fwd->domain_id);
     }
 
-    /** Domain moved to another client: wipe the previous owner's rules. */
+    /**
+     * Domain moved to another client: wipe the previous owner's rules.
+     * Throws (and changes nothing) while the server cannot be cleaned, so the
+     * previous owner's forwarders can never stay live; callers/cron retry.
+     */
     public static function resetOwner($fwd, $newClientId)
     {
         try {
             self::unprovision($fwd, 'pending', 'owner changed');
         } catch (\Throwable $e) {
-            // Rules are deleted below regardless; cron/admin can clean the server.
+            throw new \RuntimeException('Forwarding for ' . $fwd->domain . ' is being reset after an ownership change. Please try again later.', 0, $e);
         }
         Capsule::table(Schema::T_URL)->where('fwd_domain_id', $fwd->id)->delete();
         Capsule::table(Schema::T_EMAIL)->where('fwd_domain_id', $fwd->id)->delete();
@@ -414,7 +448,9 @@ class Service
         $destHost = strtolower((string) parse_url($dest, PHP_URL_HOST));
         if ($destHost === $fwd->domain || $destHost === 'www.' . $fwd->domain) {
             $destPath = rtrim((string) parse_url($dest, PHP_URL_PATH), '/');
-            if ($wildcard || $destPath === '' || $destPath === rtrim($path, '/')) {
+            $srcPath = rtrim($path, '/');
+            if ($wildcard || $destPath === '' || strcasecmp($destPath, $srcPath) === 0
+                || ($srcPath !== '' && stripos($destPath . '/', $srcPath . '/') === 0)) {
                 Validator::fail('The destination would loop back to the same address.');
             }
         }
@@ -492,7 +528,7 @@ class Service
             Validator::fail('Forwarder not found.');
         }
         Capsule::table(Schema::T_URL)->where('id', $row->id)->delete();
-        if ($fwd->status === 'active') {
+        if (self::isPlaced($fwd)) {
             try {
                 self::deployWeb($fwd);
             } catch (\Throwable $e) {
@@ -557,8 +593,10 @@ class Service
             };
         }
 
+        $panel = null;
+        $ref = [];
         try {
-            if ($fwd->status === 'active') {
+            if (self::isPlaced($fwd)) {
                 list(, $panel) = self::panelFor($fwd);
                 $ref = self::ref($fwd);
                 $old = $existing ? self::splitDestinations($existing->destinations) : null;
@@ -570,6 +608,15 @@ class Service
             }
         } catch (\Throwable $e) {
             $undo();
+            if ($panel !== null) {
+                // The server may hold part of the change: put it back to the stored state.
+                $restore = $existing ? self::splitDestinations($existing->destinations) : [];
+                try {
+                    $panel->syncEmailForwarder($fwd->domain, $ref, $local, null, $restore);
+                } catch (\Throwable $ignored) {
+                    self::markError($fwd, 'email_save: server state for ' . $address . ' may differ; re-sync required. ' . $e->getMessage());
+                }
+            }
             throw $e;
         }
 
@@ -584,7 +631,7 @@ class Service
         if (!$row) {
             Validator::fail('Forwarder not found.');
         }
-        if ($fwd->status === 'active') {
+        if (self::isPlaced($fwd)) {
             list(, $panel) = self::panelFor($fwd);
             $ref = self::ref($fwd);
             self::remote($fwd, 'email_delete', function () use ($panel, $fwd, $ref, $row) {
@@ -616,7 +663,7 @@ class Service
         self::touch($fwd, ['catchall' => $dest]);
         $fwd = self::reload($fwd);
         try {
-            if ($fwd->status === 'active') {
+            if (self::isPlaced($fwd)) {
                 list(, $panel) = self::panelFor($fwd);
                 $ref = self::ref($fwd);
                 self::remote($fwd, 'catchall', function () use ($panel, $fwd, $ref, $dest) {
@@ -627,6 +674,9 @@ class Service
             }
         } catch (\Throwable $e) {
             self::touch($fwd, ['catchall' => $previous]);
+            if (self::isPlaced($fwd)) {
+                self::markError($fwd, 'catchall: server state may differ; re-sync required. ' . $e->getMessage());
+            }
             throw $e;
         }
         $summary = '*@' . $fwd->domain . ' -> ' . ($dest ?: 'disabled (reject)');
@@ -636,7 +686,7 @@ class Service
 
     public static function supportsDomainEmail($fwd)
     {
-        $server = self::server($fwd, $fwd->status !== 'active');
+        $server = self::server($fwd, !self::isPlaced($fwd) && $fwd->status !== 'active');
         return $server && PanelFactory::make($server)->supports('domain_email');
     }
 
@@ -660,7 +710,7 @@ class Service
         self::touch($fwd, ['domain_forward' => $dest]);
         $fwd = self::reload($fwd);
         try {
-            if ($fwd->status === 'active') {
+            if (self::isPlaced($fwd)) {
                 list(, $panel) = self::panelFor($fwd);
                 $ref = self::ref($fwd);
                 if ($panel->supports('domain_email')) {
@@ -673,6 +723,9 @@ class Service
             }
         } catch (\Throwable $e) {
             self::touch($fwd, ['domain_forward' => $previous]);
+            if (self::isPlaced($fwd)) {
+                self::markError($fwd, 'domain_forward: server state may differ; re-sync required. ' . $e->getMessage());
+            }
             throw $e;
         }
         $summary = '@' . $fwd->domain . ' -> ' . ($dest ? '@' . $dest : 'disabled');
@@ -694,7 +747,7 @@ class Service
         }
         $policy = Tld::policy($domainRow->domain);
         $action = $policy['auto_action'];
-        if ($action === 'none' && $policy['park_only']) {
+        if ($policy['park_only'] && $action !== 'none') {
             $action = 'park';
         }
         if ($action === 'none') {
@@ -736,6 +789,9 @@ class Service
 
     public static function cron()
     {
+        // Log retention.
+        Capsule::table(Schema::T_LOGS)->where('created_at', '<', date('Y-m-d H:i:s', strtotime('-180 days')))->delete();
+
         $serverDomains = [];
         foreach (Capsule::table(Schema::T_DOMAINS)->get()->all() as $fwd) {
             try {
@@ -760,7 +816,7 @@ class Service
                 if (in_array($fwd->status, ['suspended', 'error', 'pending'], true)) {
                     if ($content) {
                         $fwd = self::provision($fwd);
-                    } elseif ($fwd->status !== 'pending') {
+                    } elseif ($fwd->status !== 'pending' || $fwd->remote_ref) {
                         $fwd = self::unprovision($fwd, 'pending', 'no forwarders');
                     }
                     continue;

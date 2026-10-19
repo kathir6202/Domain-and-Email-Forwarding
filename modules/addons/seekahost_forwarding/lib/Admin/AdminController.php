@@ -210,22 +210,29 @@ class AdminController
         if ($id && !$existing) {
             Validator::fail('Server not found.');
         }
-        $secrets = ['password', 'api_token', 'ftp_pass'];
-        $targetChanged = $existing && (strtolower($existing->hostname) !== strtolower($data['hostname'])
-            || $existing->type !== $data['type'] || strtolower((string) $existing->ftp_host) !== strtolower($data['ftp_host']));
-        foreach ($secrets as $secret) {
-            if (isset($in[$secret]) && $in[$secret] !== '') {
+        // Never send stored credentials to a new host without re-entry.
+        $panelChanged = $existing && (strtolower($existing->hostname) !== strtolower($data['hostname']) || $existing->type !== $data['type']);
+        $oldFtpHost = $existing ? strtolower($existing->ftp_host ?: $existing->hostname) : '';
+        $ftpChanged = $existing && ($oldFtpHost !== strtolower($data['ftp_host'] ?: $data['hostname']) || $existing->type !== $data['type']);
+        $usesFtp = in_array($type, ['directadmin', 'plesk'], true);
+        $entered = function ($key) use ($in) {
+            return isset($in[$key]) && $in[$key] !== '';
+        };
+        if (($panelChanged || !$existing) && !$entered('password') && !$entered('api_token')) {
+            Validator::fail($existing
+                ? 'The hostname or type changed: please re-enter the password or API token.'
+                : 'Enter a password or an API token.');
+        }
+        $ftpViaPanelPassword = ($data['ftp_user'] ?: $data['account']) === $data['username'];
+        if ($usesFtp && $ftpChanged && !$entered('ftp_pass') && !($ftpViaPanelPassword && $entered('password'))) {
+            Validator::fail('The FTP host changed: please re-enter the FTP password.');
+        }
+        foreach (['password' => $panelChanged, 'api_token' => $panelChanged, 'ftp_pass' => $ftpChanged] as $secret => $changed) {
+            if ($entered($secret)) {
                 $data[$secret] = encrypt($in[$secret]);
-            } elseif ($targetChanged) {
-                // Never send stored credentials to a new host without re-entry.
+            } elseif ($changed) {
                 $data[$secret] = null;
             }
-        }
-        if ($targetChanged && empty($in['password']) && empty($in['api_token'])) {
-            Validator::fail('The hostname, FTP host or type changed: please re-enter the password or API token (and FTP password).');
-        }
-        if (!$existing && empty($in['password']) && empty($in['api_token'])) {
-            Validator::fail('Enter a password or an API token.');
         }
         $data['updated_at'] = date('Y-m-d H:i:s');
 
@@ -491,7 +498,7 @@ class AdminController
             if ($row) {
                 try {
                     $fwd = Service::fwdDomain($row);
-                } catch (\InvalidArgumentException $e) {
+                } catch (\Throwable $e) {
                     echo '<div class="alert alert-danger">' . self::e($e->getMessage()) . '</div>';
                     return;
                 }
@@ -727,11 +734,11 @@ class AdminController
             echo '<div class="alert alert-success">New token: <code style="font-size:14px">' . self::e($_SESSION['shfwd_new_token']) . '</code></div>';
             unset($_SESSION['shfwd_new_token']);
         }
-        echo '<p>Endpoint: <code>' . self::e($endpoint) . '</code> &mdash; send the token in the <code>X-API-Token</code> header (or <code>token</code> parameter), '
-            . 'with <code>action</code> and parameters via GET or POST. Responses are JSON.</p>'
+        echo '<p>Endpoint: <code>' . self::e($endpoint) . '</code> &mdash; send the token in the <code>X-API-Token</code> header (or a <code>token</code> POST field &mdash; never in the URL), '
+            . 'with <code>action</code> and parameters via GET or POST. Responses are JSON. Behind a proxy or load balancer, configure WHMCS Trusted Proxies so IP restrictions see the real client IP.</p>'
             . '<p>Actions: <code>domains</code> (client_id), <code>redirects</code> / <code>email_forwarders</code> (domain_id or domain), '
-            . '<code>redirect_create</code> (source_path, destination, type, www_mode, wildcard, preserve_query, title...), <code>redirect_delete</code> (id), '
-            . '<code>email_forwarder_create</code> (local_part, destinations), <code>email_forwarder_delete</code> (id), <code>catchall_set</code> (destination).</p>';
+            . '<code>redirect_create</code> / <code>redirect_update</code> (id, source_path, destination, type, www_mode, wildcard, preserve_query, title...), <code>redirect_delete</code> (id), '
+            . '<code>email_forwarder_create</code> / <code>email_forwarder_update</code> (id, local_part, destinations), <code>email_forwarder_delete</code> (id), <code>catchall_set</code> (destination).</p>';
 
         echo '<table class="table table-striped"><thead><tr><th>Name</th><th>Token</th><th>Allowed IPs</th><th>Active</th><th>Last Used</th><th></th></tr></thead><tbody>';
         foreach (Capsule::table(Schema::T_TOKENS)->orderBy('name')->get()->all() as $t) {

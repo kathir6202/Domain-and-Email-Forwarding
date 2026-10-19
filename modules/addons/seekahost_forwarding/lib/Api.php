@@ -47,15 +47,33 @@ class Api
         Logger::log('api_token', 'API token #' . (int) $id . ' revoked');
     }
 
+    /** @return array|null [binaryAddress, prefixBits|null] for a valid IP or CIDR rule */
+    private static function parseRule($rule)
+    {
+        $parts = explode('/', $rule, 2);
+        $bin = @inet_pton($parts[0]);
+        if ($bin === false || !filter_var($parts[0], FILTER_VALIDATE_IP)) {
+            return null;
+        }
+        if (count($parts) === 1) {
+            return [$bin, null];
+        }
+        $max = strlen($bin) * 8;
+        if (!preg_match('/^\d{1,3}$/', $parts[1]) || (int) $parts[1] > $max) {
+            return null;
+        }
+        return [$bin, (int) $parts[1]];
+    }
+
     private static function normaliseIps($ips)
     {
         $out = [];
         foreach (preg_split('/[\s,;]+/', (string) $ips, -1, PREG_SPLIT_NO_EMPTY) as $ip) {
-            $base = explode('/', $ip)[0];
-            if (!filter_var($base, FILTER_VALIDATE_IP)) {
-                Validator::fail('Invalid IP address or range: ' . $ip);
+            $rule = self::parseRule($ip);
+            if ($rule === null) {
+                Validator::fail('Invalid IP address or CIDR range: ' . $ip);
             }
-            $out[] = $ip;
+            $out[] = inet_ntop($rule[0]) . ($rule[1] === null ? '' : '/' . $rule[1]);
         }
         return implode(', ', $out);
     }
@@ -66,20 +84,22 @@ class Api
         if ($allowed === '') {
             return true;
         }
-        foreach (preg_split('/[\s,]+/', $allowed, -1, PREG_SPLIT_NO_EMPTY) as $rule) {
-            if (strpos($rule, '/') === false) {
-                if ($rule === $ip) {
+        $ipBin = @inet_pton((string) $ip);
+        if ($ipBin === false) {
+            return false;
+        }
+        foreach (preg_split('/[\s,]+/', $allowed, -1, PREG_SPLIT_NO_EMPTY) as $text) {
+            $rule = self::parseRule($text);
+            if ($rule === null || strlen($rule[0]) !== strlen($ipBin)) {
+                continue; // malformed rules never grant access
+            }
+            list($subBin, $bits) = $rule;
+            if ($bits === null) {
+                if ($subBin === $ipBin) {
                     return true;
                 }
                 continue;
             }
-            list($subnet, $bits) = explode('/', $rule, 2);
-            $ipBin = @inet_pton($ip);
-            $subBin = @inet_pton($subnet);
-            if ($ipBin === false || $subBin === false || strlen($ipBin) !== strlen($subBin)) {
-                continue;
-            }
-            $bits = (int) $bits;
             $bytes = intdiv($bits, 8);
             $rem = $bits % 8;
             if (substr($ipBin, 0, $bytes) !== substr($subBin, 0, $bytes)) {
@@ -108,7 +128,12 @@ class Api
         }
         $row = Capsule::table(Schema::T_TOKENS)->where('token_hash', hash('sha256', $token))->where('active', 1)->first();
         if (!$row) {
-            Logger::log('api_auth', 'Rejected API request with an invalid token from ' . $ip, 'warning', null, null, 'api');
+            $recent = Capsule::table(Schema::T_LOGS)->where('action', 'api_auth')
+                ->where('message', 'like', '%from ' . $ip)
+                ->where('created_at', '>', date('Y-m-d H:i:s', time() - 3600))->exists();
+            if (!$recent) {
+                Logger::log('api_auth', 'Rejected API request(s) with an invalid token from ' . $ip, 'warning', null, null, 'api');
+            }
             throw new ApiException('Invalid API token.', 401);
         }
         if (!self::ipAllowed($ip, $row->allowed_ips)) {
@@ -138,11 +163,21 @@ class Api
         if (!$row) {
             throw new ApiException('Domain not found.', 404);
         }
-        list($ok, $reason) = Service::eligibility($row);
+        list($ok, $reason) = Service::access($row);
         if (!$ok) {
             throw new ApiException($reason, 409);
         }
         return Service::fwdDomain($row);
+    }
+
+    private static function bools(array $p, array $keys)
+    {
+        foreach ($keys as $k) {
+            if (array_key_exists($k, $p)) {
+                $p[$k] = filter_var($p[$k], FILTER_VALIDATE_BOOLEAN) ? 1 : 0;
+            }
+        }
+        return $p;
     }
 
     private static function urlRow($r)
@@ -194,9 +229,21 @@ class Api
             case 'redirect_create':
             case 'redirect_update':
                 $fwd = self::fwdFrom($p);
-                $p += ['preserve_query' => 1];
-                Service::saveUrl($fwd, $p, $action === 'redirect_update' ? (int) (isset($p['id']) ? $p['id'] : 0) ?: -1 : null);
-                return ['redirects' => array_map([__CLASS__, 'urlRow'], Service::urls($fwd))];
+                $p = self::bools($p, ['wildcard', 'preserve_query']);
+                $id = null;
+                if ($action === 'redirect_update') {
+                    $id = isset($p['id']) ? (int) $p['id'] : 0;
+                    $current = Capsule::table(Schema::T_URL)->where('fwd_domain_id', $fwd->id)->where('id', $id)->first();
+                    if (!$current) {
+                        throw new ApiException('Redirect not found.', 404);
+                    }
+                    // Omitted fields keep their stored values.
+                    $p += self::urlRow($current);
+                } else {
+                    $p += ['preserve_query' => 1];
+                }
+                Service::saveUrl($fwd, $p, $id);
+                return ['redirects' => array_map([__CLASS__, 'urlRow'], Service::urls(Service::reload($fwd)))];
 
             case 'redirect_delete':
                 $fwd = self::fwdFrom($p);
@@ -217,7 +264,7 @@ class Api
                 if (isset($p['destinations']) && is_array($p['destinations'])) {
                     $p['destinations'] = implode(',', $p['destinations']);
                 }
-                Service::saveEmail($fwd, $p, $action === 'email_forwarder_update' ? (int) (isset($p['id']) ? $p['id'] : 0) ?: -1 : null);
+                Service::saveEmail($fwd, $p, $action === 'email_forwarder_update' ? max(-1, (int) (isset($p['id']) ? $p['id'] : -1)) : null);
                 return self::handle('email_forwarders', $p);
 
             case 'email_forwarder_delete':

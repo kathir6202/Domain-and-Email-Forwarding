@@ -36,13 +36,18 @@ class ClientController
     /** WHMCS user/contact permission to manage domains (account owners always pass). */
     private static function canManageDomains()
     {
-        if (!function_exists('checkContactPermission') && defined('ROOTDIR') && is_file(ROOTDIR . '/includes/clientareafunctions.php')) {
-            require_once ROOTDIR . '/includes/clientareafunctions.php';
+        if (!function_exists('checkContactPermission') && defined('ROOTDIR')) {
+            foreach (['/includes/clientfunctions.php', '/includes/clientareafunctions.php'] as $file) {
+                if (!function_exists('checkContactPermission') && is_file(ROOTDIR . $file)) {
+                    require_once ROOTDIR . $file;
+                }
+            }
         }
         if (function_exists('checkContactPermission')) {
             return (bool) checkContactPermission('managedomains', true);
         }
-        return true;
+        \SeekaHost\Forwarding\Logger::log('permission', 'checkContactPermission() is unavailable; access denied', 'error');
+        return false;
     }
 
     private function page($title, array $vars, $breadcrumb = [])
@@ -105,7 +110,15 @@ class ClientController
             ], ['clientarea.php?action=domaindetails&id=' . $domainId => $domainRow->domain]);
         }
 
-        $fwd = Service::fwdDomain($domainRow);
+        try {
+            $fwd = Service::fwdDomain($domainRow);
+        } catch (\Throwable $e) {
+            return $this->page('Domain & Email Forwarding', [
+                'mode' => 'error',
+                'error' => $e instanceof \InvalidArgumentException ? $e->getMessage() : 'Forwarding for this domain is temporarily unavailable. Please try again later.',
+                'domainId' => $domainId,
+            ]);
+        }
 
         if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $this->handlePost($fwd, $domainId);

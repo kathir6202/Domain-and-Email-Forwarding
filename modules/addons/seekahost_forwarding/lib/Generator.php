@@ -82,9 +82,11 @@ class Generator
 \$rules = json_decode(base64_decode('{$payload}'), true);
 \$parkedOnly = {$parkedOnly};
 \$uri = isset(\$_SERVER['REQUEST_URI']) ? \$_SERVER['REQUEST_URI'] : '/';
-\$path = parse_url(\$uri, PHP_URL_PATH);
-if (!is_string(\$path) || \$path === '') {
-    \$path = '/';
+\$path = explode('?', \$uri, 2);
+\$path = explode('#', \$path[0], 2);
+\$path = \$path[0];
+if (\$path === '' || \$path[0] !== '/') {
+    \$path = '/' . ltrim(\$path, '/');
 }
 if (\$path === '/index.php') {
     \$path = '/';
