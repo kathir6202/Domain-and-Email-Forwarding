@@ -69,7 +69,9 @@ abstract class AbstractPanel implements PanelInterface
             throw new \RuntimeException('Connection to ' . $this->server->hostname . ' failed: ' . $error);
         }
         if ($code === 401 || $code === 403) {
-            throw new \RuntimeException('Authentication to ' . $this->server->hostname . ' failed (HTTP ' . $code . ').');
+            $reason = trim(preg_replace('/\s+/', ' ', strip_tags((string) $response)));
+            throw new \RuntimeException('Authentication to ' . $this->server->hostname . ' failed (HTTP ' . $code . ')'
+                . ($reason !== '' ? ': ' . substr($reason, 0, 300) : '.'));
         }
         return [$code, $response];
     }
