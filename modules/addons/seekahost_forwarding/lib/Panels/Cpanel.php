@@ -176,8 +176,8 @@ class Cpanel extends AbstractPanel
             return ['sub' => self::labelOf($row) ?: 'x', 'dir' => $dir, 'main' => $main];
         }
 
-        // Unique label: readable prefix + hash, so different domains never collide.
-        $sub = substr(preg_replace('/[^a-z0-9]/', '', $domain), 0, 20) . substr(md5($domain), 0, 6);
+        // Opaque, unique label: the internal subdomain (label.maindomain) must not reveal the customer's domain.
+        $sub = 'f' . substr(md5($domain), 0, 12);
         $dir = self::DOCROOT_BASE . '/' . $domain;
         $this->cpanel(2, 'AddonDomain', 'addaddondomain', [
             'newdomain' => $domain,
@@ -185,7 +185,21 @@ class Cpanel extends AbstractPanel
             'dir' => $dir,
         ]);
         $this->protectBaseDir();
+        $this->excludeFromAutoSsl($sub . '.' . $main);
         return ['sub' => $sub, 'dir' => $dir, 'main' => $main];
+    }
+
+    /**
+     * Keep the internal label.maindomain name out of AutoSSL certificates, so public
+     * Certificate Transparency logs cannot link customer domains to the forwarding account.
+     */
+    private function excludeFromAutoSsl($name)
+    {
+        try {
+            $this->cpanel(3, 'SSL', 'add_autossl_excluded_domains', ['domains' => $name]);
+        } catch (\RuntimeException $e) {
+            // Older cPanel versions: hardening only.
+        }
     }
 
     /** Stop directory listing of the folder holding every forwarded docroot. */
