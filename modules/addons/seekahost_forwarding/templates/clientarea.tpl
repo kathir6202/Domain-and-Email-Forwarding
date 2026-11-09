@@ -49,7 +49,9 @@
     {if !$serverReady}
         <div class="alert alert-warning">Forwarding is being set up for our platform. Please try again later.</div>
     {/if}
-    {if $disabled}
+    {if $migrating}
+        <div class="alert alert-info">We are upgrading the forwarding service for this domain. Your current forwarding keeps working; changes will be possible again shortly.</div>
+    {elseif $disabled}
         <div class="alert alert-warning">Forwarding for this domain has been disabled by our team. Please contact support.</div>
     {/if}
     {if $parkOnly}

@@ -42,7 +42,7 @@ class Cpanel extends AbstractPanel
         return $json;
     }
 
-    private function whm($function, array $params = [])
+    protected function whm($function, array $params = [])
     {
         $params['api.version'] = 1;
         list(, $body) = $this->http('GET', $this->baseUrl() . '/json-api/' . $function . '?' . http_build_query($params), $this->headers(), null, null, $function);
@@ -54,7 +54,13 @@ class Cpanel extends AbstractPanel
         return isset($json['data']) ? $json['data'] : [];
     }
 
-    private function cpanel($version, $module, $function, array $params = [])
+    /** Generic cPanel API access for tools such as the migration wizard. */
+    public function call($version, $module, $function, array $params = [])
+    {
+        return $this->cpanel($version, $module, $function, $params);
+    }
+
+    protected function cpanel($version, $module, $function, array $params = [])
     {
         $query = [
             'cpanel_jsonapi_user' => $this->server->account,

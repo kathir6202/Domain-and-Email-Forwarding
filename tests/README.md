@@ -8,6 +8,7 @@ cd tests
 composer install
 php tests.php                          # business logic, lifecycle, API (expects "FAIL 0")
 php ui.php vendor/autoload.php         # admin pages, hooks, client template (Smarty 4)
+php migration.php                      # migration wizard end-to-end (simulated cPanel account + real HTTP checks)
 ```
 
 Not part of the distributed zip.

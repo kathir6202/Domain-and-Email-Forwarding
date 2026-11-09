@@ -14,6 +14,7 @@ use WHMCS\Database\Capsule;
  *   error     - a provisioning/sync step failed; retried by cron
  *   suspended - removed automatically (ineligible); restored automatically when eligible again
  *   disabled  - removed by an administrator; only an administrator "Sync" restores it
+ *   migrating - rules imported by the migration wizard; the old module still serves the domain
  *
  * Validation problems throw \InvalidArgumentException (safe to show to clients);
  * server problems throw \RuntimeException (logged, admins notified).
@@ -202,6 +203,9 @@ class Service
      */
     public static function provision($fwd)
     {
+        if ($fwd->status === 'migrating') {
+            Validator::fail('This domain is being migrated from the previous forwarding module. Finish or cancel it in the Migration tab first.');
+        }
         list($server, $panel) = self::panelFor($fwd, !self::isPlaced($fwd) && $fwd->status !== 'active');
         try {
             $ref = self::remote($fwd, 'provision', function () use ($panel, $fwd) {
@@ -801,7 +805,7 @@ class Service
                     continue;
                 }
                 $fwd = self::fwdDomain($domainRow, false);
-                if (!$fwd || $fwd->status === 'disabled') {
+                if (!$fwd || in_array($fwd->status, ['disabled', 'migrating'], true)) {
                     continue;
                 }
                 list($ok, $reason) = self::access($domainRow);

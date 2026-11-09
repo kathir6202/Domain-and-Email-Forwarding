@@ -5,6 +5,7 @@ namespace SeekaHost\Forwarding\Admin;
 use SeekaHost\Forwarding\Api;
 use SeekaHost\Forwarding\Input;
 use SeekaHost\Forwarding\Logger;
+use SeekaHost\Forwarding\Migration\Migrator;
 use SeekaHost\Forwarding\Panels\PanelFactory;
 use SeekaHost\Forwarding\Schema;
 use SeekaHost\Forwarding\Service;
@@ -16,7 +17,11 @@ use WHMCS\Database\Capsule;
 class AdminController
 {
     const PER_PAGE = 50;
-    const STATUSES = ['pending', 'active', 'error', 'suspended', 'disabled'];
+    const STATUSES = ['pending', 'active', 'error', 'suspended', 'disabled', 'migrating'];
+    const MIGRATION_STATES = [
+        'discovered' => 'default', 'scanned' => 'info', 'imported' => 'primary', 'migrated' => 'success',
+        'failed' => 'warning', 'rolled_back' => 'warning', 'rollback_failed' => 'danger', 'skipped' => 'default',
+    ];
 
     private $link;
     private $in = [];
@@ -97,6 +102,9 @@ class AdminController
             case 'api':
                 $this->api();
                 break;
+            case 'migration':
+                $this->migration();
+                break;
             case 'logs':
                 $this->logs();
                 break;
@@ -108,7 +116,7 @@ class AdminController
 
     private function nav($action)
     {
-        $tabs = ['dashboard' => 'Dashboard', 'domains' => 'Domains & Forwarders', 'servers' => 'Servers', 'tlds' => 'TLD Settings', 'api' => 'API', 'logs' => 'Logs'];
+        $tabs = ['dashboard' => 'Dashboard', 'domains' => 'Domains & Forwarders', 'servers' => 'Servers', 'tlds' => 'TLD Settings', 'api' => 'API', 'migration' => 'Migration', 'logs' => 'Logs'];
         $map = ['domain' => 'domains', 'server' => 'servers'];
         $current = isset($map[$action]) ? $map[$action] : $action;
         echo '<ul class="nav nav-tabs">';
@@ -141,6 +149,9 @@ class AdminController
                     break;
                 case 'api':
                     $this->postApi($op);
+                    break;
+                case 'migration':
+                    $this->postMigration($op);
                     break;
             }
         } catch (\InvalidArgumentException $e) {
@@ -485,7 +496,7 @@ class AdminController
 
     private function statusLabel($status)
     {
-        $map = ['active' => 'success', 'pending' => 'default', 'suspended' => 'warning', 'disabled' => 'warning', 'error' => 'danger'];
+        $map = ['active' => 'success', 'pending' => 'default', 'suspended' => 'warning', 'disabled' => 'warning', 'error' => 'danger', 'migrating' => 'info'];
         $cls = isset($map[$status]) ? $map[$status] : 'default';
         return '<span class="label label-' . $cls . ' badge badge-' . $cls . '">' . self::e(ucfirst($status)) . '</span>';
     }
@@ -755,6 +766,205 @@ class AdminController
             . '<input type="hidden" name="op" value="create">Name <input type="text" name="name" class="form-control" required> '
             . 'Allowed IPs <input type="text" name="allowed_ips" class="form-control" style="width:260px" placeholder="comma separated, empty = any"> '
             . '<button class="btn btn-success">Create Token</button></form></div>';
+    }
+
+    /* ------------------------------------------------------------- migration */
+
+    private function postMigration($op)
+    {
+        $in = $this->in;
+        $serverId = !empty($in['server_id']) ? (int) $in['server_id'] : (isset($_SESSION['shfwd_mig_server']) ? (int) $_SESSION['shfwd_mig_server'] : 0);
+        $ids = isset($in['ids']) && is_array($in['ids']) ? array_values(array_filter(array_map('intval', $in['ids']))) : [];
+        $back = ['action' => 'migration'];
+        if (function_exists('set_time_limit')) {
+            @set_time_limit(0);
+        }
+        switch ($op) {
+            case 'discover':
+                $_SESSION['shfwd_mig_server'] = $serverId;
+                list($n, $global) = Migrator::forServer($serverId)->discover();
+                $this->flash('success', 'Discovered ' . $n . ' domain(s). Next: scan them (read-only).');
+                if ($global) {
+                    $this->flash('error', $global . ' redirect(s) on this cPanel account apply to ALL its domains. They are not migrated per domain; review them in cPanel > Redirects.');
+                }
+                break;
+            case 'scan':
+                list($done, $left) = Migrator::forServer($serverId)->scanBatch(10);
+                $this->flash('success', 'Scanned ' . $done . ' domain(s); ' . $left . ' waiting.');
+                if ($left > 0 && !empty($in['auto'])) {
+                    $back['continue'] = 'scan';
+                }
+                break;
+            case 'import':
+                list($done, $errors) = Migrator::forServer($serverId)->import($ids);
+                $this->flash('success', 'Imported ' . $done . ' domain(s) (dry run: nothing changed on the server yet).');
+                foreach (array_slice($errors, 0, 10) as $err) {
+                    $this->flash('error', $err);
+                }
+                break;
+            case 'cancel':
+                $this->flash('success', Migrator::cancel($ids) . ' import(s) cancelled.');
+                break;
+            case 'rescan':
+                Migrator::rescan($ids);
+                $this->flash('success', 'Selected domains will be scanned again.');
+                break;
+            case 'skip':
+                $this->flash('success', Migrator::skip($ids) . ' domain(s) skipped.');
+                break;
+            case 'stop':
+                unset($_SESSION['shfwd_mig_queue']);
+                $this->flash('success', 'Stopped. Domains not processed yet keep their current state.');
+                break;
+            case 'move':
+                $billing = isset($in['billing']) ? (string) $in['billing'] : '';
+                if (!isset(Migrator::BILLING[$billing])) {
+                    Validator::fail('Choose how migrated domains are billed.');
+                }
+                if (!$ids) {
+                    Validator::fail('Select the imported domains to move.');
+                }
+                if ($billing === 'all') {
+                    Migrator::setAccessModeAll();
+                }
+                $_SESSION['shfwd_mig_queue'] = [
+                    'server' => $serverId,
+                    'ids' => $ids,
+                    'opts' => ['billing' => $billing, 'accept_diff' => !empty($in['accept_diff'])],
+                    'size' => max(1, min(20, (int) (isset($in['batch']) ? $in['batch'] : 5))),
+                ];
+                Logger::log('migration', 'Move started for ' . count($ids) . ' domain(s), billing: ' . $billing);
+                // no break: process the first batch now
+            case 'move_continue':
+                $q = isset($_SESSION['shfwd_mig_queue']) ? $_SESSION['shfwd_mig_queue'] : null;
+                if (!$q) {
+                    break;
+                }
+                $left = Migrator::forServer($q['server'])->moveBatch($q['ids'], $q['opts'], $q['size']);
+                if ($left) {
+                    $_SESSION['shfwd_mig_queue']['ids'] = $left;
+                    $back['continue'] = 'move';
+                    $this->flash('success', 'Batch done; ' . count($left) . ' domain(s) left.');
+                } else {
+                    unset($_SESSION['shfwd_mig_queue']);
+                    $this->flash('success', 'Move finished. Review the results below.');
+                }
+                break;
+        }
+        $this->redirect($back);
+    }
+
+    private function migration()
+    {
+        $servers = Capsule::table(Schema::T_SERVERS)->where('type', 'cpanel')->orderBy('name')->get()->all();
+        echo '<h2>Migrate from the previous forwarding module</h2>'
+            . '<p>Moves domains that an older forwarding module (e.g. ModulesGarden) set up on a cPanel account into this module, on the <strong>same account</strong>, so customers change no DNS. '
+            . 'Each domain is moved on its own: the old setup is detached, the new one is created, and the live web redirects and email routing are compared with what they did before. '
+            . 'If anything differs, the old setup is put back automatically.</p>'
+            . '<div class="alert alert-warning"><strong>Before you start:</strong> back up the WHMCS database and the cPanel account. Steps 1&ndash;3 never change the server.</div>';
+        if (!$servers) {
+            echo '<div class="alert alert-info">Add the cPanel server (with the account the old module uses) under <a href="' . self::e($this->url(['action' => 'servers'])) . '">Servers</a> first.</div>';
+            return;
+        }
+        $serverId = isset($_SESSION['shfwd_mig_server']) ? (int) $_SESSION['shfwd_mig_server'] : (int) $servers[0]->id;
+        $mig = $this->url(['action' => 'migration']);
+        $token = $this->token();
+
+        // Auto-continue for long scans / moves.
+        $continue = (string) $this->q('continue');
+        if ($continue === 'scan' || ($continue === 'move' && !empty($_SESSION['shfwd_mig_queue']))) {
+            echo '<form method="post" id="shfwd-continue" action="' . self::e($mig) . '">' . $token
+                . '<input type="hidden" name="op" value="' . ($continue === 'scan' ? 'scan' : 'move_continue') . '"><input type="hidden" name="auto" value="1">'
+                . '<input type="hidden" name="server_id" value="' . $serverId . '"></form>'
+                . '<div class="alert alert-info">Working&hellip; the next batch starts automatically. '
+                . '<form method="post" class="inline" action="' . self::e($mig) . '">' . $token
+                . '<input type="hidden" name="op" value="stop"><button class="btn btn-xs btn-sm btn-default">Stop</button></form></div>'
+                . '<script>setTimeout(function(){document.getElementById("shfwd-continue").submit();}, 800);</script>';
+        }
+
+        $options = '';
+        foreach ($servers as $s) {
+            $options .= '<option value="' . (int) $s->id . '"' . ($serverId === (int) $s->id ? ' selected' : '') . '>' . self::e($s->name . ' (' . $s->account . '@' . $s->hostname . ')') . '</option>';
+        }
+        $counts = Capsule::table(Schema::T_MIGRATION)->where('server_id', $serverId)->selectRaw('state, count(*) as n')->groupBy('state')->pluck('n', 'state');
+        $count = function ($state) use ($counts) {
+            return (int) (isset($counts[$state]) ? $counts[$state] : 0);
+        };
+
+        echo '<div class="well"><form method="post" class="form-inline" action="' . self::e($mig) . '">' . $token
+            . '<strong>1. Discover</strong> &nbsp; cPanel server / account used by the old module: <select name="server_id" class="form-control">' . $options . '</select> '
+            . '<button class="btn btn-default" name="op" value="discover">Discover domains</button></form>'
+            . '<form method="post" class="form-inline" style="margin-top:8px" action="' . self::e($mig) . '">' . $token
+            . '<input type="hidden" name="server_id" value="' . $serverId . '"><strong>2. Scan</strong> (read-only) &nbsp; '
+            . $count('discovered') . ' waiting &nbsp; <label><input type="checkbox" name="auto" value="1" checked> continue automatically</label> '
+            . '<button class="btn btn-default" name="op" value="scan"' . ($count('discovered') ? '' : ' disabled') . '>Scan</button></form>'
+            . '<p style="margin:8px 0 0"><strong>3. Import</strong> (dry run, server unchanged) and <strong>4. Move</strong>: select domains in the table below.</p></div>';
+
+        $summary = [];
+        foreach (self::MIGRATION_STATES as $state => $cls) {
+            if ($count($state)) {
+                $summary[] = '<a href="' . self::e($this->url(['action' => 'migration', 'state' => $state])) . '"><span class="label label-' . $cls . ' badge badge-' . $cls . '">'
+                    . self::e(str_replace('_', ' ', $state)) . ': ' . $count($state) . '</span></a>';
+            }
+        }
+        echo '<p>' . ($summary ? implode(' ', $summary) . ' &nbsp; <a href="' . self::e($mig) . '">show all</a>' : 'No domains discovered yet.') . '</p>';
+
+        $q = Capsule::table(Schema::T_MIGRATION)->where('server_id', $serverId);
+        $stateFilter = (string) $this->q('state');
+        if (isset(self::MIGRATION_STATES[$stateFilter])) {
+            $q->where('state', $stateFilter);
+        }
+        $rows = $q->orderBy('domain')->limit(500)->get()->all();
+        if (!$rows) {
+            return;
+        }
+
+        $billing = '';
+        foreach (Migrator::BILLING as $k => $label) {
+            $billing .= '<label style="display:block;font-weight:normal"><input type="radio" name="billing" value="' . $k . '"' . ($k === 'flag' ? ' checked' : '') . '> ' . self::e($label) . '</label>';
+        }
+        echo '<form method="post" action="' . self::e($mig) . '">' . $token . '<input type="hidden" name="server_id" value="' . $serverId . '">'
+            . '<table class="table table-striped table-condensed"><thead><tr><th><input type="checkbox" onclick="var c=this.checked;document.querySelectorAll(\'.shfwd-mig-id\').forEach(function(x){x.checked=c;});"></th>'
+            . '<th>Domain</th><th>Type</th><th>Client</th><th>State</th><th>Redirects</th><th>Email aliases</th><th>Catch-all</th><th>Domain fwd</th><th>Issues / result</th></tr></thead><tbody>';
+        foreach ($rows as $r) {
+            $map = Migrator::decode($r, 'mapping');
+            $issues = Migrator::decode($r, 'issues');
+            $cls = isset(self::MIGRATION_STATES[$r->state]) ? self::MIGRATION_STATES[$r->state] : 'default';
+            $issueHtml = '';
+            foreach ($issues as $i) {
+                $issueHtml .= '<div' . ($r->blocking ? ' class="text-danger"' : ' class="text-muted"') . '>&bull; ' . self::e($i) . '</div>';
+            }
+            if ($r->message) {
+                $issueHtml .= '<div><strong>' . self::e($r->message) . '</strong></div>';
+            }
+            $details = '';
+            foreach (['mapping' => 'Planned rules', 'snapshot' => 'Snapshot of the old setup', 'result' => 'Verification'] as $f => $label) {
+                if ($r->$f) {
+                    $details .= '<details><summary>' . $label . '</summary><pre style="max-height:300px;overflow:auto;font-size:11px">'
+                        . self::e(json_encode(json_decode($r->$f, true), JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES)) . '</pre></details>';
+                }
+            }
+            echo '<tr><td><input type="checkbox" class="shfwd-mig-id" name="ids[]" value="' . (int) $r->id . '"></td>'
+                . '<td>' . self::e(Validator::toUnicode($r->domain)) . '</td><td>' . self::e($r->kind) . '</td>'
+                . '<td>' . ($r->client_id ? '<a href="clientssummary.php?userid=' . (int) $r->client_id . '">#' . (int) $r->client_id . '</a>' : '-') . '</td>'
+                . '<td><span class="label label-' . $cls . ' badge badge-' . $cls . '">' . self::e(str_replace('_', ' ', $r->state)) . '</span>' . ($r->blocking ? ' <span class="label label-danger badge badge-danger">blocked</span>' : '') . '</td>'
+                . '<td>' . (isset($map['urls']) ? count($map['urls']) : '-') . '</td>'
+                . '<td>' . (isset($map['emails']) ? count($map['emails']) : '-') . '</td>'
+                . '<td>' . self::e(!empty($map['catchall']) ? $map['catchall'] : '-') . '</td>'
+                . '<td>' . self::e(!empty($map['domain_forward']) ? $map['domain_forward'] : '-') . '</td>'
+                . '<td style="max-width:420px">' . $issueHtml . $details . '</td></tr>';
+        }
+        echo '</tbody></table>'
+            . '<div class="well"><p><strong>With the selected domains:</strong></p><p>'
+            . '<button class="btn btn-primary" name="op" value="import">3. Import (dry run)</button> '
+            . '<button class="btn btn-default" name="op" value="cancel">Cancel import</button> '
+            . '<button class="btn btn-default" name="op" value="rescan">Re-scan</button> '
+            . '<button class="btn btn-default" name="op" value="skip">Skip</button></p>'
+            . '<hr><p><strong>4. Move imported domains</strong> &mdash; billing for migrated domains:</p>' . $billing
+            . '<p style="margin-top:8px">Domains per batch <input type="number" name="batch" value="5" min="1" max="20" class="form-control" style="display:inline-block;width:80px"> '
+            . '<label style="font-weight:normal"><input type="checkbox" name="accept_diff" value="1"> keep the new setup even if the verification shows differences (not recommended)</label></p>'
+            . '<button class="btn btn-success" name="op" value="move" onclick="return confirm(\'Move the selected imported domains now? Each one is verified and rolled back automatically if anything differs.\')">4. Move selected</button>'
+            . '</div></form>';
     }
 
     private function logs()

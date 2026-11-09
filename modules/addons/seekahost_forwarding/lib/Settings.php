@@ -45,6 +45,11 @@ class Settings
         return self::$cache;
     }
 
+    public static function flush()
+    {
+        self::$cache = null;
+    }
+
     public static function get($key)
     {
         $all = self::all();

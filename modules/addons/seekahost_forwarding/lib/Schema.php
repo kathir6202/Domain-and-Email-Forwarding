@@ -13,6 +13,7 @@ class Schema
     const T_LOGS = 'mod_seekahost_forwarding_logs';
     const T_TLDS = 'mod_seekahost_forwarding_tlds';
     const T_TOKENS = 'mod_seekahost_forwarding_api_tokens';
+    const T_MIGRATION = 'mod_seekahost_forwarding_migration';
 
     const EMAIL_TEMPLATE = 'SeekaHost Forwarding Notification';
 
@@ -150,6 +151,26 @@ class Schema
             });
         }
 
+        if (!$schema->hasTable(self::T_MIGRATION)) {
+            $schema->create(self::T_MIGRATION, function ($t) {
+                $t->increments('id');
+                $t->unsignedInteger('server_id')->index();
+                $t->string('domain', 191)->unique();
+                $t->string('kind', 10)->default('parked');
+                $t->unsignedInteger('domain_id')->nullable();
+                $t->unsignedInteger('client_id')->nullable();
+                $t->string('state', 20)->default('discovered')->index();
+                $t->boolean('blocking')->default(0);
+                $t->text('issues')->nullable();
+                $t->longText('snapshot')->nullable();
+                $t->longText('mapping')->nullable();
+                $t->longText('result')->nullable();
+                $t->text('message')->nullable();
+                $t->dateTime('created_at')->nullable();
+                $t->dateTime('updated_at')->nullable();
+            });
+        }
+
         self::migrate();
         self::installEmailTemplate();
     }
@@ -209,7 +230,7 @@ class Schema
     public static function uninstall()
     {
         $schema = Capsule::schema();
-        foreach ([self::T_TOKENS, self::T_TLDS, self::T_LOGS, self::T_EMAIL, self::T_URL, self::T_DOMAINS, self::T_SERVERS] as $table) {
+        foreach ([self::T_MIGRATION, self::T_TOKENS, self::T_TLDS, self::T_LOGS, self::T_EMAIL, self::T_URL, self::T_DOMAINS, self::T_SERVERS] as $table) {
             $schema->dropIfExists($table);
         }
         Capsule::table('tblemailtemplates')->where('name', self::EMAIL_TEMPLATE)->delete();

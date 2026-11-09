@@ -28,6 +28,9 @@ Service::saveUrl($fwd, ['source_path' => '/', 'destination' => 'https://dest.com
 Service::saveEmail(Service::reload($fwd), ['local_part' => 'info', 'destinations' => 'a@b.com,c@d.com']);
 Service::setCatchAll(Service::reload($fwd), 'all@b.com');
 SeekaHost\Forwarding\Api::createToken('t1', '');
+Capsule::table(Schema::T_MIGRATION)->insert(['server_id' => 1, 'domain' => 'old-<x>.com', 'kind' => 'parked', 'state' => 'scanned', 'blocking' => 1,
+    'issues' => json_encode(['Issue <x>']), 'mapping' => json_encode(['urls' => [['source_path' => '/']], 'emails' => ['info' => ['a@b.com']], 'catchall' => null, 'domain_forward' => null, 'parked' => false]),
+    'snapshot' => json_encode(['redirects' => []]), 'message' => 'msg <x>']);
 
 $errors = 0;
 function check($html, $label, array $mustContain = []) {
@@ -41,7 +44,7 @@ function check($html, $label, array $mustContain = []) {
 // ---- admin pages
 $_SERVER['REQUEST_METHOD'] = 'GET';
 $_SESSION = [];
-foreach (['dashboard', 'domains', 'domain', 'servers', 'server', 'tlds', 'api', 'logs'] as $action) {
+foreach (['dashboard', 'domains', 'domain', 'servers', 'server', 'tlds', 'api', 'migration', 'logs'] as $action) {
     $_GET = $_REQUEST = ['module' => 'seekahost_forwarding', 'action' => $action];
     if ($action === 'domain') { $_GET['fid'] = $_REQUEST['fid'] = 1; }
     if ($action === 'server') { $_GET['id'] = $_REQUEST['id'] = 1; }
@@ -50,7 +53,7 @@ foreach (['dashboard', 'domains', 'domain', 'servers', 'server', 'tlds', 'api', 
     catch (Throwable $e) { $errors++; echo "ADMIN $action threw: " . $e->getMessage() . ' @' . $e->getFile() . ':' . $e->getLine() . "\n"; }
     $html = ob_get_clean();
     $expect = ['dashboard' => ['Recent Activity'], 'domains' => ['example.com', 'Manage'], 'domain' => ['URL Forwarders', 'info@example.com', 'all@b.com'],
-        'servers' => ['S1'], 'server' => ['Verify SSL Certificate'], 'tlds' => ['.com', '.net', 'Automatic action'], 'api' => ['api.php', 't1'], 'logs' => ['url_add']];
+        'servers' => ['S1'], 'server' => ['Verify SSL Certificate'], 'tlds' => ['.com', '.net', 'Automatic action'], 'api' => ['api.php', 't1'], 'migration' => ['Discover domains', 'old-&lt;x&gt;.com', 'Issue &lt;x&gt;', '4. Move selected', 'Planned rules'], 'logs' => ['url_add']];
     check($html, "admin:$action", $expect[$action]);
 }
 $_GET = $_REQUEST = ['module' => 'seekahost_forwarding', 'action' => 'domains', 'q' => 'Ann', 'status' => 'active'];
