@@ -550,10 +550,22 @@ class Migrator
         }
         $snap = self::decode($rec, 'snapshot');
         $map = self::decode($rec, 'mapping');
-        $addonRow = isset($snap['addon']) ? $snap['addon'] : null;
 
-        // 1. The live setup must still be exactly what was scanned.
+        // 1. Read the domain as cPanel has it right now (its internal name may differ from the scan,
+        //    e.g. after a manual restore) and make sure its forwarding is still exactly what was scanned.
         try {
+            $inv = $this->legacy->inventory();
+            $addonRow = null;
+            if ($rec->kind === 'addon') {
+                if (!isset($inv['addon'][$d])) {
+                    self::fail($rec, 'The addon domain is not on the cPanel account any more. Restore it (see the snapshot), then Re-scan. Nothing was changed.');
+                    return;
+                }
+                $addonRow = $inv['addon'][$d];
+            } elseif (!in_array($d, $inv['parked'], true)) {
+                self::fail($rec, 'The domain is not parked on the cPanel account any more. Restore it (see the snapshot), then Re-scan. Nothing was changed.');
+                return;
+            }
             $live = $this->readLive($d, $rec->kind, $addonRow);
         } catch (\Throwable $e) {
             self::fail($rec, 'Could not read the current setup: ' . $e->getMessage() . ' Nothing was changed.');
@@ -563,7 +575,7 @@ class Migrator
             self::fail($rec, 'The setup on the server changed since the scan. Cancel the import, re-scan and import again. Nothing was changed.');
             return;
         }
-        $result = ['before' => $live['probes'], 'started_at' => date('Y-m-d H:i:s')];
+        $result = ['before' => $live['probes'], 'addon_before' => $addonRow, 'started_at' => date('Y-m-d H:i:s')];
 
         // 2. Detach the legacy domain (its .htaccess redirects stay on disk for an instant rollback).
         try {

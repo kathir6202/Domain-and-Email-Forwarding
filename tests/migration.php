@@ -215,6 +215,28 @@ ok(Migrator::markRestored([rec('q.com')->id]) === 1 && rec('q.com')->state === '
 $m->moveBatch([rec('q.com')->id], $opts, 1);
 ok(rec('q.com')->state === 'migrated' && http('q.com', '/') === [301, 'https://q.com-dest.org/'], 'q.com migrated after mark restored');
 
+// Addon domain whose internal name changed after the scan (e.g. restored by hand / older rollback)
+Capsule::table('tbldomains')->insert(['id' => ++$id, 'userid' => 1, 'domain' => 'r.com', 'status' => 'Active', 'emailforwarding' => 0]);
+FakeCpanel::$st['addon']['r.com'] = ['label' => 'r.com', 'dir' => 'public_html/r.com'];
+@mkdir($work . '/home/public_html/r.com', 0777, true);
+FakeCpanel::$st['redirects'][] = ['domain' => 'r.com', 'sourceurl' => '/', 'destination' => 'https://r-dest.org/', 'type' => 'permanent', 'wildcard' => 0, 'matchwww' => 1];
+FakeCpanel::persist();
+$m = Migrator::forServer($sid);
+$m->discover();
+$m->scanBatch(50);
+$m->import([rec('r.com')->id]);
+FakeCpanel::$st['addon']['r.com']['label'] = 'r'; // now r.main.com instead of r.com.main.com
+FakeCpanel::persist();
+Capsule::table(Schema::T_URL)->where('fwd_domain_id', fwdOf('r.com')->id)->update(['destination' => 'https://wrong.example/']);
+$m->moveBatch([rec('r.com')->id], $opts, 1);
+ok(rec('r.com')->state === 'rolled_back' && FakeCpanel::$st['addon']['r.com']['label'] === 'r', 'changed addon name: detach uses the live key, rollback restores the live name: ' . rec('r.com')->message);
+Capsule::table(Schema::T_URL)->where('fwd_domain_id', fwdOf('r.com')->id)->update(['destination' => 'https://r-dest.org/']);
+$m->moveBatch([rec('r.com')->id], $opts, 1);
+ok(rec('r.com')->state === 'migrated' && http('www.r.com', '/') === [301, 'https://r-dest.org/'], 'changed addon name migrates: ' . rec('r.com')->message);
+unset(FakeCpanel::$st['parked']['p.com']); FakeCpanel::persist();
+$m->moveBatch([rec('p.com')->id], $opts, 1);
+ok(rec('p.com')->state === 'failed' && strpos(rec('p.com')->message, 'not parked') !== false, 'missing domain: clean failure, nothing changed');
+
 // ---- access mode switch
 Migrator::setAccessModeAll();
 ok(SeekaHost\Forwarding\Settings::get('access_mode') === 'all', 'access mode all');
