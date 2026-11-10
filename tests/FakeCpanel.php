@@ -11,6 +11,15 @@ class FakeCpanel extends \SeekaHost\Forwarding\Panels\Cpanel
     public static $home;
     public static $failOn = [];
     public static $calls = [];
+    /** Simulated Apache rebuild delay: stale answers per changed domain. */
+    public static $lag = 0;
+
+    private static function changed($domain)
+    {
+        if (self::$lag > 0) {
+            $GLOBALS['shfwd_stale'][strtolower($domain)] = self::$lag;
+        }
+    }
 
     public static function reset($home, $file)
     {
@@ -61,6 +70,7 @@ class FakeCpanel extends \SeekaHost\Forwarding\Panels\Cpanel
                     throw new RuntimeException('The domain ' . $d . ' already exists.');
                 }
                 $st['addon'][$d] = ['label' => $p['subdomain'], 'dir' => $p['dir']];
+                self::changed($d);
                 @mkdir(self::$home . '/' . $p['dir'], 0777, true);
                 break;
             case 'AddonDomain::deladdondomain':
@@ -70,16 +80,19 @@ class FakeCpanel extends \SeekaHost\Forwarding\Panels\Cpanel
                 }
                 unset($st['addon'][$d]);
                 self::dropMail($d);
+                self::changed($d);
                 break;
             case 'Park::park':
                 if (isset($st['addon'][$p['domain']])) {
                     throw new RuntimeException('Domain already exists.');
                 }
                 $st['parked'][$p['domain']] = true;
+                self::changed($p['domain']);
                 break;
             case 'Park::unpark':
                 unset($st['parked'][$p['domain']]);
                 self::dropMail($p['domain']); // worst case: cPanel drops the domain's mail routing
+                self::changed($p['domain']);
                 break;
             case 'Mime::list_redirects':
                 $out = $st['redirects'];
@@ -128,6 +141,9 @@ class FakeCpanel extends \SeekaHost\Forwarding\Panels\Cpanel
                 break;
             case 'Variables::get_user_information':
                 $out = ['home' => self::$home];
+                break;
+            case 'Ftp::delete_ftp':
+                $st['ftp_deleted'][] = $p['user'];
                 break;
             case 'SSL::add_autossl_excluded_domains':
             case 'SSL::start_autossl_check':

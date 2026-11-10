@@ -91,6 +91,9 @@ if (\$path === '' || \$path[0] !== '/') {
 if (\$path === '/index.php') {
     \$path = '/';
 }
+if (isset(\$_SERVER['HTTP_X_SHFWD_PROBE'])) {
+    header('X-Shfwd-Served: 1'); // lets the migration wizard see this script is live
+}
 \$qs = isset(\$_SERVER['QUERY_STRING']) ? \$_SERVER['QUERY_STRING'] : '';
 if (\$qs === '' && isset(\$_SERVER['REDIRECT_QUERY_STRING'])) {
     \$qs = \$_SERVER['REDIRECT_QUERY_STRING'];

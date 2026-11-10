@@ -8,20 +8,8 @@ $path = explode('?', $uri, 2);
 $query = isset($path[1]) ? $path[1] : '';
 $path = $path[0];
 
-if (isset($st['addon'][$base])) {
-    $dir = $st['home'] . '/' . $st['addon'][$base]['dir'];
-    if (is_file($dir . '/index.php')) {
-        $_SERVER['QUERY_STRING'] = $query;
-        chdir($dir);
-        include $dir . '/index.php';
-        return true;
-    }
-    http_response_code(200);
-    echo 'old addon site';
-    return true;
-}
-if (isset($st['parked'][$base])) {
-    // cPanel-style redirects stored in the main docroot .htaccess
+// cPanel-style redirects (stored in the domain's docroot .htaccess)
+$cpanelRedirect = function () use ($st, $host, $base, $path, $query) {
     foreach ($st['redirects'] as $r) {
         if ($r['domain'] !== $base && $r['domain'] !== 'www.' . $base) {
             continue;
@@ -47,7 +35,26 @@ if (isset($st['parked'][$base])) {
         header('Location: ' . $loc, true, $r['type'] === 'permanent' ? 301 : 302);
         return true;
     }
-    echo 'main site';
+    return false;
+};
+
+if (isset($st['addon'][$base])) {
+    $dir = $st['home'] . '/' . $st['addon'][$base]['dir'];
+    if (is_file($dir . '/index.php')) {
+        $_SERVER['QUERY_STRING'] = $query;
+        chdir($dir);
+        include $dir . '/index.php';
+        return true;
+    }
+    if (!$cpanelRedirect()) {
+        echo 'old addon site';
+    }
+    return true;
+}
+if (isset($st['parked'][$base])) {
+    if (!$cpanelRedirect()) {
+        echo 'main site';
+    }
     return true;
 }
 http_response_code(404);

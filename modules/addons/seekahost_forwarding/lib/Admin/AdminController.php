@@ -779,6 +779,8 @@ class AdminController
         if (function_exists('set_time_limit')) {
             @set_time_limit(0);
         }
+        // A domain must never be left half-moved because the browser disconnected.
+        @ignore_user_abort(true);
         switch ($op) {
             case 'discover':
                 $_SESSION['shfwd_mig_server'] = $serverId;
@@ -812,6 +814,19 @@ class AdminController
             case 'skip':
                 $this->flash('success', Migrator::skip($ids) . ' domain(s) skipped.');
                 break;
+            case 'recheck':
+                $migrator = Migrator::forServer($serverId);
+                foreach (Capsule::table(Schema::T_MIGRATION)->whereIn('id', $ids)->get()->all() as $rec) {
+                    list($ok, $message) = $migrator->recheck($rec);
+                    $this->flash($ok ? 'success' : 'error', $message);
+                }
+                break;
+            case 'mark_restored':
+                $n = Migrator::markRestored($ids);
+                $this->flash($n ? 'success' : 'error', $n
+                    ? $n . ' domain(s) marked as restored. They can be moved again.'
+                    : 'Nothing marked: only "rollback failed" domains whose new setup is no longer on the server can be marked as restored.');
+                break;
             case 'stop':
                 unset($_SESSION['shfwd_mig_queue']);
                 $this->flash('success', 'Stopped. Domains not processed yet keep their current state.');
@@ -831,7 +846,7 @@ class AdminController
                     'server' => $serverId,
                     'ids' => $ids,
                     'opts' => ['billing' => $billing, 'accept_diff' => !empty($in['accept_diff'])],
-                    'size' => max(1, min(20, (int) (isset($in['batch']) ? $in['batch'] : 5))),
+                    'size' => max(1, min(5, (int) (isset($in['batch']) ? $in['batch'] : 1))),
                 ];
                 Logger::log('migration', 'Move started for ' . count($ids) . ' domain(s), billing: ' . $billing);
                 // no break: process the first batch now
@@ -840,7 +855,16 @@ class AdminController
                 if (!$q) {
                     break;
                 }
-                $left = Migrator::forServer($q['server'])->moveBatch($q['ids'], $q['opts'], $q['size']);
+                $migrator = Migrator::forServer($q['server']);
+                try {
+                    $left = $migrator->moveBatch($q['ids'], $q['opts'], $q['size']);
+                } catch (\InvalidArgumentException $e) {
+                    unset($_SESSION['shfwd_mig_queue']);
+                    throw $e;
+                }
+                if ($migrator->notice !== '') {
+                    $this->flash('error', $migrator->notice);
+                }
                 if ($left) {
                     $_SESSION['shfwd_mig_queue']['ids'] = $left;
                     $back['continue'] = 'move';
@@ -960,8 +984,13 @@ class AdminController
             . '<button class="btn btn-default" name="op" value="cancel">Cancel import</button> '
             . '<button class="btn btn-default" name="op" value="rescan">Re-scan</button> '
             . '<button class="btn btn-default" name="op" value="skip">Skip</button></p>'
+            . '<p><strong>Rollback failed?</strong> Restore the domain (see its snapshot), then: '
+            . '<button class="btn btn-info" name="op" value="recheck">Re-check</button> '
+            . '<button class="btn btn-warning" name="op" value="mark_restored" onclick="return confirm(\'Only use this after you have confirmed the old setup works again. Mark the selected rollback-failed domains as restored?\')">Mark restored</button> '
+            . '<small class="text-muted">Re-check compares the live setup with the snapshot; Mark restored is a manual override.</small></p>'
             . '<hr><p><strong>4. Move imported domains</strong> &mdash; billing for migrated domains:</p>' . $billing
-            . '<p style="margin-top:8px">Domains per batch <input type="number" name="batch" value="5" min="1" max="20" class="form-control" style="display:inline-block;width:80px"> '
+            . '<p style="margin-top:8px">Domains per batch <input type="number" name="batch" value="1" min="1" max="5" class="form-control" style="display:inline-block;width:80px"> '
+            . '<small class="text-muted">Each domain can take up to ' . (int) Migrator::$wait . ' s while cPanel rebuilds Apache; a pre-flight test runs before every batch.</small> '
             . '<label style="font-weight:normal"><input type="checkbox" name="accept_diff" value="1"> keep the new setup even if the verification shows differences (not recommended)</label></p>'
             . '<button class="btn btn-success" name="op" value="move" onclick="return confirm(\'Move the selected imported domains now? Each one is verified and rolled back automatically if anything differs.\')">4. Move selected</button>'
             . '</div></form>';

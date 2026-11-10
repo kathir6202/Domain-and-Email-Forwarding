@@ -21,6 +21,21 @@ usleep(500000);
 register_shutdown_function(function () use ($proc) { proc_terminate($proc); });
 
 PanelFactory::$factory = function ($server) { return new FakeCpanel($server); };
+Migrator::$wait = 3;
+Migrator::$interval = 0;
+// Apache rebuild lag: a changed domain answers with the server default page for a while.
+SeekaHost\Forwarding\Migration\Prober::$impl = function ($ip, $host, $path) {
+    $base = strpos($host, 'www.') === 0 ? substr($host, 4) : $host;
+    if (!empty($GLOBALS['shfwd_stale'][$base])) {
+        $GLOBALS['shfwd_stale'][$base]--;
+        return [200, '', false];
+    }
+    $impl = SeekaHost\Forwarding\Migration\Prober::$impl;
+    SeekaHost\Forwarding\Migration\Prober::$impl = null;
+    $r = SeekaHost\Forwarding\Migration\Prober::probe($ip, $host, $path);
+    SeekaHost\Forwarding\Migration\Prober::$impl = $impl;
+    return $r;
+};
 require dirname(__DIR__) . '/modules/addons/seekahost_forwarding/seekahost_forwarding.php';
 seekahost_forwarding_activate();
 Capsule::table('tblclients')->insert(['id' => 1, 'firstname' => 'Ann', 'lastname' => 'A', 'email' => 'a@x.com']);
@@ -56,7 +71,7 @@ FakeCpanel::persist();
 
 function rec($d) { return Capsule::table(Schema::T_MIGRATION)->where('domain', $d)->first(); }
 function fwdOf($d) { return Capsule::table(Schema::T_DOMAINS)->where('domain', $d)->first(); }
-function http($host, $path) { return SeekaHost\Forwarding\Migration\Prober::probe('127.0.0.1:' . $GLOBALS['port'], $host, $path); }
+function http($host, $path) { return array_slice(SeekaHost\Forwarding\Migration\Prober::probe('127.0.0.1:' . $GLOBALS['port'], $host, $path), 0, 2); }
 
 ok(http('a.com', '/x/y?q=1') === [301, 'https://dest-a.com/x/y?q=1'], 'router emulates cPanel wildcard: ' . json_encode(http('a.com', '/x/y?q=1')));
 
@@ -133,6 +148,72 @@ $m->moveBatch([rec('k.com')->id], $opts, 5);
 FakeCpanel::$failOn = [];
 ok(rec('k.com')->state === 'rollback_failed' && strpos(rec('k.com')->message, 'ROLLBACK INCOMPLETE') !== false, 'k.com rollback_failed flagged: ' . rec('k.com')->message);
 ok((bool) array_filter($GLOBALS['localapi'], function ($c) { return $c[0] === 'SendAdminEmail' && strpos($c[1]['custommessage'], 'k.com') !== false; }), 'admin alerted for incomplete rollback');
+
+// ================= fixes: rebuild wait, pre-flight, exact label, re-check / mark restored
+$more = ['m.com', 'n.com', 'p.com', 'q.com'];
+foreach ($more as $d) {
+    Capsule::table('tbldomains')->insert(['id' => ++$id, 'userid' => 1, 'domain' => $d, 'status' => 'Active', 'emailforwarding' => 0]);
+}
+FakeCpanel::$st['parked']['m.com'] = true;
+FakeCpanel::$st['parked']['p.com'] = true;
+FakeCpanel::$st['parked']['q.com'] = true;
+FakeCpanel::$st['addon']['n.com'] = ['label' => 'n.com', 'dir' => 'public_html/n.com'];
+@mkdir($work . '/home/public_html/n.com', 0777, true);
+foreach (['m.com', 'n.com', 'p.com', 'q.com'] as $d) {
+    FakeCpanel::$st['redirects'][] = ['domain' => $d, 'sourceurl' => '/', 'destination' => 'https://' . $d . '-dest.org/', 'type' => 'permanent', 'wildcard' => 0, 'matchwww' => 1];
+}
+FakeCpanel::persist();
+$m = Migrator::forServer($sid); // new admin request: fresh view of the account
+$m->discover();
+$m->scanBatch(50);
+$m->import(Capsule::table(Schema::T_MIGRATION)->whereIn('domain', $more)->pluck('id')->all());
+ok(rec('m.com')->state === 'imported' && rec('n.com')->state === 'imported', 'more domains imported');
+
+// Fix 1: Apache lag after the move must not cause a false rollback
+FakeCpanel::$lag = 12;
+$t = microtime(true);
+$m->moveBatch([rec('m.com')->id], $opts, 1);
+ok(rec('m.com')->state === 'migrated', 'm.com migrated despite Apache lag: ' . rec('m.com')->message);
+ok(Migrator::decode(rec('m.com'), 'result')['after'][0]['module'] === true, 'verification saw the new setup (marker)');
+
+// Fix 1 + 3: real mismatch on a dotted-label addon: rollback waits for the old setup and re-adds the exact label
+Capsule::table(Schema::T_URL)->where('fwd_domain_id', fwdOf('n.com')->id)->update(['destination' => 'https://wrong.example/']);
+$m->moveBatch([rec('n.com')->id], $opts, 1);
+ok(rec('n.com')->state === 'rolled_back', 'n.com rolled back and verified despite lag: ' . rec('n.com')->message);
+ok(isset(FakeCpanel::$st['addon']['n.com']) && FakeCpanel::$st['addon']['n.com']['label'] === 'n.com' && FakeCpanel::$st['addon']['n.com']['dir'] === 'public_html/n.com', 'n.com re-added with exact original label/dir: ' . json_encode(FakeCpanel::$st['addon']['n.com'] ?? null));
+ok(SeekaHost\Forwarding\Migration\CpanelLegacy::originalLabel(['subdomain' => 'uniquebusinessidea.net', 'rootdomain' => 'x.com', 'fullsubdomain' => 'uniquebusinessidea.net.x.com']) === 'uniquebusinessidea.net', 'originalLabel keeps dots');
+FakeCpanel::$lag = 0;
+
+// Fix 2: pre-flight stops before any domain is touched
+FakeCpanel::$failOn['AddonDomain::addaddondomain'] = 'You have exceeded the maximum allowed FTP (File Transfer Protocol) accounts.';
+try {
+    $m->moveBatch([rec('p.com')->id], $opts, 1);
+    ok(false, 'pre-flight should block');
+} catch (InvalidArgumentException $e) {
+    ok(strpos($e->getMessage(), 'Pre-flight check failed') !== false, 'pre-flight blocks on limits');
+}
+ok(rec('p.com')->state === 'imported' && isset(FakeCpanel::$st['parked']['p.com']), 'p.com untouched by failed pre-flight');
+FakeCpanel::$failOn['AddonDomain::addaddondomain'] = 'Sorry, the domain is not registered';
+ok(strpos($m->preflight(), 'could not run') !== false, 'pre-flight non-limit error is only a note');
+unset(FakeCpanel::$failOn['AddonDomain::addaddondomain']);
+ok($m->preflight() === '' && !array_filter(array_keys(FakeCpanel::$st['addon']), function ($d) { return strpos($d, 'shfwd-preflight-') === 0; }), 'pre-flight cleans up its test domain');
+ok(!empty(FakeCpanel::$st['ftp_deleted']), 'pre-flight removes its FTP account');
+
+// Fix 4: re-check after a manual restore, and mark restored
+ok(rec('k.com')->state === 'rollback_failed', 'k.com still rollback_failed');
+list($okRc) = $m->recheck(rec('k.com'));
+ok(!$okRc && strpos(rec('k.com')->message, 'not parked') !== false, 're-check reports k.com not restored: ' . rec('k.com')->message);
+FakeCpanel::$st['parked']['k.com'] = true; // admin restores it by hand
+FakeCpanel::$st['fwd']['k.com'] = [['info@k.com', 'k@gmail.com']];
+FakeCpanel::persist();
+list($okRc) = $m->recheck(rec('k.com'));
+ok($okRc && rec('k.com')->state === 'rolled_back', 're-check confirms manual restore: ' . rec('k.com')->message);
+$m->moveBatch([rec('k.com')->id], $opts, 1);
+ok(rec('k.com')->state === 'migrated', 'k.com migrated after re-check: ' . rec('k.com')->message);
+Capsule::table(Schema::T_MIGRATION)->where('domain', 'q.com')->update(['state' => 'rollback_failed']);
+ok(Migrator::markRestored([rec('q.com')->id]) === 1 && rec('q.com')->state === 'rolled_back', 'mark restored');
+$m->moveBatch([rec('q.com')->id], $opts, 1);
+ok(rec('q.com')->state === 'migrated' && http('q.com', '/') === [301, 'https://q.com-dest.org/'], 'q.com migrated after mark restored');
 
 // ---- access mode switch
 Migrator::setAccessModeAll();

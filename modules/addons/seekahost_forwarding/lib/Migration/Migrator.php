@@ -37,9 +37,18 @@ class Migrator
     ];
 
     private $server;
+    /** Seconds to wait for cPanel to rebuild and reload Apache after a domain is added or removed. */
+    public static $wait = 150;
+    /** Seconds between checks while waiting. */
+    public static $interval = 5;
+
     /** @var CpanelLegacy */
     private $legacy;
+    /** @var Cpanel */
+    private $panel;
     private $ip;
+    /** Non-blocking note from the last pre-flight check, for the admin page. */
+    public $notice = '';
 
     public function __construct($server)
     {
@@ -51,6 +60,7 @@ class Migrator
             Validator::fail('The selected server is not a cPanel server.');
         }
         $this->server = $server;
+        $this->panel = $panel;
         $this->legacy = new CpanelLegacy($panel);
         $this->ip = $server->web_ip !== '' ? $server->web_ip : gethostbyname($server->hostname);
     }
@@ -232,8 +242,8 @@ class Migrator
         $out = [];
         foreach ([$d, 'www.' . $d] as $host) {
             foreach ($paths as $p) {
-                list($code, $loc) = Prober::probe($this->ip, $host, $p);
-                $out[] = ['host' => $host, 'path' => $p, 'code' => (int) $code, 'location' => (string) $loc];
+                $r = Prober::probe($this->ip, $host, $p);
+                $out[] = ['host' => $host, 'path' => $p, 'code' => (int) $r[0], 'location' => (string) $r[1], 'module' => !empty($r[2])];
             }
         }
         return $out;
@@ -487,6 +497,7 @@ class Migrator
      */
     public function moveBatch(array $ids, array $opts, $limit = 5)
     {
+        $this->notice = $this->preflight();
         $batch = array_slice($ids, 0, $limit);
         foreach ($batch as $id) {
             $rec = Capsule::table(Schema::T_MIGRATION)->where('id', (int) $id)->where('server_id', $this->server->id)->first();
@@ -566,8 +577,13 @@ class Migrator
         try {
             Capsule::table(Schema::T_DOMAINS)->where('id', $fwd->id)->update(['status' => 'pending', 'server_id' => $this->server->id, 'remote_ref' => null]);
             Service::provision(Service::reload($fwd));
-            $after = $this->probeAll($d, self::probePaths($live['redirects']));
-            $diffs = array_merge(self::compare($live['probes'], $after), $this->verifyEmail($d, $map));
+            list($after, $waited, $live2) = $this->awaitNew($d, $live);
+            $result['waited_seconds'] = $waited;
+            $diffs = self::compare($live['probes'], $after);
+            if (!$live2) {
+                $diffs[] = 'The new setup was not answering after ' . $waited . ' seconds (cPanel had not finished rebuilding Apache)';
+            }
+            $diffs = array_merge($diffs, $this->verifyEmail($d, $map));
             $result['after'] = $after;
             $result['diffs'] = $diffs;
             if ($diffs && empty($opts['accept_diff'])) {
@@ -603,6 +619,182 @@ class Migrator
             'message' => 'Migrated and verified.' . ($warnings ? ' ' . count($warnings) . ' note(s).' : ''),
         ]);
         Logger::log('migration', $d . ' migrated and verified', 'info', $rec->client_id, $rec->domain_id);
+    }
+
+    private static function pause()
+    {
+        if (self::$interval > 0) {
+            sleep(self::$interval);
+        }
+    }
+
+    /** Every answered probe came from this module's script (i.e. the new Apache config is live). */
+    private static function servedByModule(array $probes)
+    {
+        $answered = 0;
+        foreach ($probes as $p) {
+            if ($p['code'] > 0) {
+                $answered++;
+                if (empty($p['module'])) {
+                    return false;
+                }
+            }
+        }
+        return $answered > 0;
+    }
+
+    private static function anyServedByModule(array $probes)
+    {
+        foreach ($probes as $p) {
+            if (!empty($p['module'])) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Wait until the new setup answers (cPanel rebuilds Apache asynchronously).
+     * @return array [probes, seconds waited, bool new setup live]
+     */
+    private function awaitNew($d, array $live)
+    {
+        $paths = self::probePaths($live['redirects']);
+        $start = time();
+        while (true) {
+            $probes = $this->probeAll($d, $paths);
+            if (self::servedByModule($probes)) {
+                return [$probes, time() - $start, true];
+            }
+            if (time() - $start >= self::$wait) {
+                return [$probes, time() - $start, false];
+            }
+            self::pause();
+        }
+    }
+
+    /**
+     * Wait until the old setup answers again exactly as captured.
+     * @return array [probes, seconds waited]
+     */
+    private function awaitOld($d, array $live)
+    {
+        $paths = self::probePaths($live['redirects']);
+        $start = time();
+        while (true) {
+            $probes = $this->probeAll($d, $paths);
+            if (!self::compare($live['probes'], $probes) && !self::anyServedByModule($probes)) {
+                return [$probes, time() - $start];
+            }
+            if (time() - $start >= self::$wait) {
+                return [$probes, time() - $start];
+            }
+            self::pause();
+        }
+    }
+
+    /**
+     * Prove cPanel will accept an addon domain on this account before any domain is touched:
+     * create and remove a throwaway addon domain (catches FTP / addon / subdomain limits).
+     * Throws when cPanel refuses for a limit reason; returns a note for other refusals.
+     */
+    public function preflight()
+    {
+        $name = 'shfwd-preflight-' . substr(md5(uniqid('', true)), 0, 10) . '.com';
+        try {
+            $ref = $this->panel->addDomain($name);
+        } catch (\Throwable $e) {
+            if (preg_match('/exceed|maximum|quota|limit|not allowed|disk|reached/i', $e->getMessage())) {
+                Logger::log('migration', 'Pre-flight check failed: ' . $e->getMessage(), 'error');
+                Validator::fail('Pre-flight check failed, no domain was touched: cPanel refused to create an addon domain on account '
+                    . $this->server->account . ' (' . $e->getMessage() . '). Raise the account limits (Max FTP Accounts, Max Addon Domains, '
+                    . 'Max Subdomains) in WHM, then click Move again.');
+            }
+            return 'Pre-flight test could not run (' . $e->getMessage() . '); continuing.';
+        }
+        $note = '';
+        try {
+            $this->panel->removeDomain($name, $ref);
+        } catch (\Throwable $e) {
+            $note = 'The pre-flight test domain ' . $name . ' could not be removed (' . $e->getMessage() . '); remove it in cPanel > Domains.';
+        }
+        if (!empty($ref['sub'])) {
+            $this->legacy->deleteFtpAccount($ref['sub']);
+        }
+        return $note;
+    }
+
+    /**
+     * Check that the old setup is back and matches the snapshot (after a rollback that could not be verified).
+     * @return array [bool ok, string message]
+     */
+    public function recheck($rec)
+    {
+        if (!in_array($rec->state, ['rollback_failed', 'rolled_back', 'failed'], true)) {
+            return [false, $rec->domain . ': only failed or rolled-back domains can be re-checked.'];
+        }
+        $snap = self::decode($rec, 'snapshot');
+        $d = $rec->domain;
+        $problems = [];
+        $fwd = $rec->domain_id ? Capsule::table(Schema::T_DOMAINS)->where('domain_id', $rec->domain_id)->first() : null;
+        if ($fwd && Service::isPlaced($fwd)) {
+            $problems[] = 'the new module setup is still registered for this domain';
+        }
+        $inv = $this->legacy->inventory();
+        if ($rec->kind === 'parked' && !in_array($d, $inv['parked'], true)) {
+            $problems[] = 'the domain is not parked on the account';
+        }
+        if ($rec->kind === 'addon') {
+            if (!isset($inv['addon'][$d])) {
+                $problems[] = 'the addon domain is missing from the account';
+            } elseif (strpos((string) CpanelLegacy::field($inv['addon'][$d], ['reldir', 'dir']), 'seekahost_fwd/') !== false) {
+                $problems[] = 'the addon domain still uses this module\'s folder';
+            }
+        }
+        if (!$problems) {
+            try {
+                $live = $this->readLive($d, $rec->kind, isset($inv['addon'][$d]) ? $inv['addon'][$d] : null);
+                if (self::fingerprint($live) !== self::fingerprint($snap)) {
+                    $problems[] = 'its redirects or email routing differ from the snapshot';
+                }
+                foreach (self::compare($snap['probes'], $live['probes']) as $diff) {
+                    $problems[] = $diff;
+                }
+            } catch (\Throwable $e) {
+                $problems[] = 'could not read the current setup: ' . $e->getMessage();
+            }
+        }
+        if ($problems) {
+            $message = 'Re-check ' . date('Y-m-d H:i') . ': not restored yet: ' . implode('; ', $problems) . '.';
+            self::save($rec, ['message' => $message]);
+            return [false, $d . ': ' . $message];
+        }
+        if ($fwd) {
+            Capsule::table(Schema::T_DOMAINS)->where('id', $fwd->id)->update(['status' => 'migrating', 'remote_ref' => null]);
+        }
+        $message = 'Re-check ' . date('Y-m-d H:i') . ': the old setup is live and matches the snapshot. You can move it again.';
+        self::save($rec, ['state' => 'rolled_back', 'message' => $message]);
+        Logger::log('migration', $d . ': ' . $message, 'info', $rec->client_id, $rec->domain_id);
+        return [true, $d . ': ' . $message];
+    }
+
+    /** Admin confirms a rollback-failed domain was restored by hand. */
+    public static function markRestored(array $ids)
+    {
+        $n = 0;
+        foreach (Capsule::table(Schema::T_MIGRATION)->whereIn('id', $ids)->where('state', 'rollback_failed')->get()->all() as $rec) {
+            $fwd = $rec->domain_id ? Capsule::table(Schema::T_DOMAINS)->where('domain_id', $rec->domain_id)->first() : null;
+            if ($fwd && Service::isPlaced($fwd)) {
+                continue; // the new setup is still on the server: not restored
+            }
+            if ($fwd) {
+                Capsule::table(Schema::T_DOMAINS)->where('id', $fwd->id)->update(['status' => 'migrating', 'remote_ref' => null]);
+            }
+            self::save($rec, ['state' => 'rolled_back', 'message' => 'Marked as restored by an administrator on ' . date('Y-m-d H:i') . '.']);
+            Logger::log('migration', $rec->domain . ' marked as restored by an administrator', 'warning', $rec->client_id, $rec->domain_id);
+            $n++;
+        }
+        return $n;
     }
 
     /** @return string[] differences for every probe that redirected before */
@@ -665,10 +857,12 @@ class Migrator
             $steps[] = 'Removing the new setup failed: ' . $e->getMessage();
         }
         Capsule::table(Schema::T_DOMAINS)->where('id', $fwd->id)->update(['status' => 'migrating', 'remote_ref' => null]);
+        $reattached = true;
         try {
             $this->legacy->reattach($rec->domain, $rec->kind, isset($live['addon']) ? $live['addon'] : null);
         } catch (\Throwable $e) {
             if (!preg_match('/already|exists/i', $e->getMessage())) {
+                $reattached = false;
                 $steps[] = 'Re-adding the old domain failed: ' . $e->getMessage();
             }
         }
@@ -677,8 +871,11 @@ class Migrator
         } catch (\Throwable $e) {
             $steps[] = 'Restoring email routing failed: ' . $e->getMessage();
         }
-        $back = $this->probeAll($rec->domain, self::probePaths($live['redirects']));
+        list($back, $waited) = $reattached
+            ? $this->awaitOld($rec->domain, $live)
+            : [$this->probeAll($rec->domain, self::probePaths($live['redirects'])), 0];
         $diffs = self::compare($live['probes'], $back);
+        $result['rollback_waited_seconds'] = $waited;
         $result['rollback'] = $back;
         $result['rollback_steps'] = $steps;
         $result['rollback_diffs'] = $diffs;

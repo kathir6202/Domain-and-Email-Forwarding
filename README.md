@@ -82,9 +82,10 @@ curl -H "X-API-Token: shfwd_..." \
 The **Migration** tab moves domains that an older forwarding module set up on a cPanel account into this module. Domains stay on the **same account**, so customers change no DNS.
 
 1. **Back up** the WHMCS database and the cPanel account.
-2. In **Servers**, add the cPanel server using the **same cPanel account** the old module uses, then click **Test**.
-3. Open **Migration** and click **Discover domains**. The wizard finds the account's parked and addon domains, leaving out the main domain and domains this module already manages.
-4. Click **Scan** (read-only). For every domain the wizard reads:
+2. In WHM, set the account's **Max FTP Accounts**, **Max Addon Domains**, **Max Subdomains** and **Max Aliases** to **Unlimited**. Each migrated domain becomes an addon domain, and cPanel creates an FTP account and a subdomain for each one.
+3. In **Servers**, add the cPanel server using the **same cPanel account** the old module uses, then click **Test**.
+4. Open **Migration** and click **Discover domains**. The wizard finds the account's parked and addon domains, leaving out the main domain and domains this module already manages.
+5. Click **Scan** (read-only). For every domain the wizard reads:
    - its cPanel redirects
    - its email forwarders, domain email forwarder and catch-all
    - its live HTTP behaviour, which it requests from the server directly
@@ -96,26 +97,31 @@ The **Migration** tab moves domains that an older forwarding module set up on a 
    - the server can't be reached over HTTP to check it
 
    Fix the issue in cPanel, then click **Re-scan**.
-5. Select domains and click **Import (dry run)**. The rules are copied into this module with status *migrating*. Nothing changes on the server. Clients see a short "upgrading" notice and can't edit until the move is done. **Cancel import** removes the copied rules again.
-6. Choose how migrated domains are billed:
+6. Select domains and click **Import (dry run)**. The rules are copied into this module with status *migrating*. Nothing changes on the server. Clients see a short "upgrading" notice and can't edit until the move is done. **Cancel import** removes the copied rules again.
+7. Choose how migrated domains are billed:
    - tick the Email Forwarding addon without charging
    - tick the addon and add its price to the renewal
    - switch Access Mode to *All active domains*
    - change nothing
 
-   Then click **Move selected**. Domains are processed in batches. For each domain the wizard:
+   Then click **Move selected**. Domains are processed in batches; the default is one domain per batch.
+
+   Before each batch, a **pre-flight test** creates and removes a throwaway addon domain. If cPanel refuses because of an account limit, the move stops with a clear message and no domain is touched.
+
+   For each domain the wizard then:
    1. checks the server still matches the scan, and stops without changes if it doesn't
    2. detaches the old parked or addon domain, leaving its `.htaccess` redirects on disk untouched
    3. creates the domain in this module with all its rules
-   4. compares every redirect the domain answered before, and the email routing, with the new setup
-   5. if anything differs, removes the new setup, re-attaches the old domain (its redirects work again immediately) and restores the email routing from the snapshot, then verifies the restore
+   4. **waits until cPanel has rebuilt Apache**, which can take up to 150 seconds. It recognises the new setup by a marker header that is only sent to its own check requests.
+   5. compares every redirect the domain answered before, and the email routing, with the new setup
+   6. if anything differs, removes the new setup and re-attaches the old domain with its exact original internal name and folder. It restores the email routing from the snapshot, then waits for Apache again and verifies the restore.
 
    After a successful move, the old cPanel redirect entries are deleted.
-7. Review the results:
+8. Review the results:
    - **migrated**: moved and verified
    - **rolled back**: the old setup was restored and verified
    - **failed**: nothing was changed
-   - **rollback failed**: an admin alert is sent and the full snapshot is shown so you can restore it by hand
+   - **rollback failed**: an admin alert is sent and the full snapshot is shown so you can restore it by hand. After restoring, click **Re-check**, which compares the live setup with the snapshot and sets the row to *rolled back*. Or click **Mark restored** as a manual override. The domain can then be moved again.
 
    The old module is never modified. Deactivate it yourself once you are satisfied.
 

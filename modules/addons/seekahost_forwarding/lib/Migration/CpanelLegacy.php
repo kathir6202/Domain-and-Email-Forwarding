@@ -157,14 +157,39 @@ class CpanelLegacy
         $row = $addonRow ?: [];
         $dir = (string) self::field($row, ['reldir', 'dir']);
         $dir = preg_replace('#^home:/?#', '', $dir);
-        $label = (string) self::field($row, ['subdomain']);
-        if (strpos($label, '.') !== false) {
-            $label = substr($label, 0, strpos($label, '.'));
-        }
+        $label = self::originalLabel($row);
         if ($dir === '' || $label === '') {
             throw new \RuntimeException('Cannot restore addon domain ' . $domain . ': original directory or label unknown.');
         }
         $this->cp->call(2, 'AddonDomain', 'addaddondomain', ['newdomain' => $domain, 'subdomain' => $label, 'dir' => $dir]);
+    }
+
+    /**
+     * The addon domain's internal subdomain exactly as cPanel created it, e.g. "uniquebusinessidea.net"
+     * for "uniquebusinessidea.net.maindomain.com" (labels may contain dots).
+     */
+    public static function originalLabel(array $row)
+    {
+        $root = strtolower((string) self::field($row, ['rootdomain']));
+        $full = strtolower((string) self::field($row, ['fullsubdomain']));
+        $label = strtolower((string) self::field($row, ['subdomain']));
+        if ($root !== '' && $full !== '' && substr($full, -strlen('.' . $root)) === '.' . $root) {
+            return substr($full, 0, -strlen('.' . $root));
+        }
+        if ($root !== '' && substr($label, -strlen('.' . $root)) === '.' . $root) {
+            return substr($label, 0, -strlen('.' . $root));
+        }
+        return $label;
+    }
+
+    /** Best effort: remove the FTP account cPanel creates with an addon domain (never its files). */
+    public function deleteFtpAccount($label)
+    {
+        try {
+            $this->cp->call(3, 'Ftp', 'delete_ftp', ['user' => $label, 'destroy' => 0]);
+        } catch (\Throwable $e) {
+            // Not created on this server, or FTP disabled.
+        }
     }
 
     public function deleteRedirect(array $row)
@@ -178,6 +203,7 @@ class CpanelLegacy
             $params['docroot'] = $docroot;
         }
         $this->cp->call(3, 'Mime', 'delete_redirect', $params);
+        $this->redirects = null;
     }
 
     /** Re-create email routing from a snapshot (only what is missing now). */
