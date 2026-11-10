@@ -37,8 +37,8 @@ class Migrator
     ];
 
     private $server;
-    /** Seconds to wait for cPanel to rebuild and reload Apache after a domain is added or removed. */
-    public static $wait = 150;
+    /** Seconds to wait for cPanel to rebuild and reload Apache (null = module setting, default 120). */
+    public static $wait;
     /** Seconds between checks while waiting. */
     public static $interval = 5;
 
@@ -353,7 +353,7 @@ class Migrator
                 $issues[] = 'Catch-all forwards to an address on the same domain (' . $catchall . '), which this module does not allow.';
             }
         } elseif ($raw !== '' && strpos($raw, ':fail:') !== 0 && $raw !== ':blackhole:') {
-            $issues[] = 'Unrouted mail currently goes to "' . $raw . '" (the account mailbox); after migration it will be rejected.';
+            $issues[] = 'Unrouted mail currently goes to "' . $raw . '"; it stays like this when "Keep unrouted mail as before" is ticked at Move, otherwise it will be rejected.';
         }
 
         $domainForward = null;
@@ -497,7 +497,6 @@ class Migrator
      */
     public function moveBatch(array $ids, array $opts, $limit = 5)
     {
-        $this->notice = $this->preflight();
         $batch = array_slice($ids, 0, $limit);
         foreach ($batch as $id) {
             $rec = Capsule::table(Schema::T_MIGRATION)->where('id', (int) $id)->where('server_id', $this->server->id)->first();
@@ -575,28 +574,110 @@ class Migrator
             self::fail($rec, 'The setup on the server changed since the scan. Cancel the import, re-scan and import again. Nothing was changed.');
             return;
         }
-        $result = ['before' => $live['probes'], 'addon_before' => $addonRow, 'started_at' => date('Y-m-d H:i:s')];
 
-        // 2. Detach the legacy domain (its .htaccess redirects stay on disk for an instant rollback).
+        // Option D: keep unrouted mail exactly as before (account mailbox, :fail:, :blackhole:...).
+        $keep = null;
+        $raw = (string) $live['default_address'];
+        if (!empty($opts['keep_default']) && $raw !== '' && !filter_var($raw, FILTER_VALIDATE_EMAIL)) {
+            $keep = $raw;
+        }
+        $result = [
+            'before' => $live['probes'],
+            'addon_before' => $addonRow,
+            'live' => $live,
+            'opts' => $opts,
+            'keep_default' => $keep,
+            'started_at' => date('Y-m-d H:i:s'),
+        ];
+        Capsule::table(Schema::T_DOMAINS)->where('id', $fwd->id)->update(['keep_default' => $keep]);
+
+        if ($rec->kind === 'addon') {
+            $this->moveInPlace($rec, $fwd, $live, $map, $result, $opts);
+        } else {
+            $this->moveParked($rec, $fwd, $live, $map, $result, $opts);
+        }
+    }
+
+    /**
+     * Addon domains stay on the account: only their forwarding files change, so Apache is not
+     * rebuilt, the switch is instant and a rollback just puts the saved files back.
+     */
+    private function moveInPlace($rec, $fwd, array $live, array $map, array $result, array $opts)
+    {
+        $d = $rec->domain;
+        $dir = preg_replace('#^home:/?#', '', (string) CpanelLegacy::field((array) $live['addon'], ['reldir', 'basedir']));
+        if ($dir === '') {
+            self::fail($rec, 'Could not determine the document root of the addon domain. Nothing was changed.');
+            return;
+        }
         try {
-            $this->legacy->detach($d, $rec->kind, $addonRow);
+            $result['backup'] = [
+                'dir' => $dir,
+                'htaccess' => $this->legacy->readFile($dir, '.htaccess'),
+                'index_php' => $this->legacy->readFile($dir, 'index.php'),
+            ];
+        } catch (\Throwable $e) {
+            self::fail($rec, 'Could not back up the current files: ' . $e->getMessage() . ' Nothing was changed.');
+            return;
+        }
+        $result['in_place'] = true;
+
+        try {
+            Capsule::table(Schema::T_DOMAINS)->where('id', $fwd->id)->update(['status' => 'pending', 'server_id' => $this->server->id, 'remote_ref' => null]);
+            Service::provision(Service::reload($fwd)); // adopts the existing addon domain and folder
+            list($after, $waited, $isLive) = $this->awaitNew($d, $live);
+            $result['waited_seconds'] = $waited;
+            $result['after'] = $after;
+            $diffs = self::compare($live['probes'], $after);
+            if (!$isLive) {
+                $diffs[] = 'The new forwarding files were not answering after ' . $waited . ' seconds';
+            }
+            $diffs = array_merge($diffs, $this->verifyEmail($d, $map, $result['keep_default']));
+            $result['diffs'] = $diffs;
+            if ($diffs && empty($opts['accept_diff'])) {
+                throw new \RuntimeException('Verification failed: ' . implode('; ', array_slice($diffs, 0, 5)));
+            }
+        } catch (\Throwable $e) {
+            $this->rollbackInPlace($rec, $fwd, $live, $result, $e->getMessage());
+            return;
+        }
+        $this->finalize($rec, $live, $result, $opts);
+    }
+
+    /** Parked domains must be unparked and added as addon domains, which needs an Apache rebuild. */
+    private function moveParked($rec, $fwd, array $live, array $map, array $result, array $opts)
+    {
+        $d = $rec->domain;
+        try {
+            $this->legacy->detach($d, 'parked', null);
         } catch (\Throwable $e) {
             self::fail($rec, 'Could not remove the old setup: ' . $e->getMessage() . ' Nothing was changed.');
             return;
         }
-
-        // 3. Provision in this module and verify against the captured behaviour.
         try {
             Capsule::table(Schema::T_DOMAINS)->where('id', $fwd->id)->update(['status' => 'pending', 'server_id' => $this->server->id, 'remote_ref' => null]);
             Service::provision(Service::reload($fwd));
-            list($after, $waited, $live2) = $this->awaitNew($d, $live);
-            $result['waited_seconds'] = $waited;
-            $diffs = self::compare($live['probes'], $after);
-            if (!$live2) {
-                $diffs[] = 'The new setup was not answering after ' . $waited . ' seconds (cPanel had not finished rebuilding Apache)';
+            $result['provisioned_at'] = date('Y-m-d H:i:s');
+            // Email routing does not depend on Apache: check it right away.
+            $mailDiffs = $this->verifyEmail($d, $map, $result['keep_default']);
+            if ($mailDiffs && empty($opts['accept_diff'])) {
+                throw new \RuntimeException('Verification failed: ' . implode('; ', array_slice($mailDiffs, 0, 5)));
             }
-            $diffs = array_merge($diffs, $this->verifyEmail($d, $map));
+            list($after, $waited, $isLive) = $this->awaitNew($d, $live);
+            $result['waited_seconds'] = $waited;
             $result['after'] = $after;
+            if (!$isLive) {
+                // Apache has not loaded the change yet: keep the new setup and finish verification later.
+                self::save($rec, [
+                    'state' => 'verifying',
+                    'result' => $result,
+                    'message' => 'Waiting for cPanel to reload Apache (not live after ' . $waited . ' s). '
+                        . 'Verification finishes automatically with the WHMCS cron, or click Re-check.',
+                ]);
+                Logger::log('migration', $d . ' moved; waiting for Apache before verifying', 'info', $rec->client_id, $rec->domain_id);
+                return;
+            }
+            $diffs = array_merge(self::compare($live['probes'], $after), $mailDiffs);
             $result['diffs'] = $diffs;
             if ($diffs && empty($opts['accept_diff'])) {
                 throw new \RuntimeException('Verification failed: ' . implode('; ', array_slice($diffs, 0, 5)));
@@ -605,8 +686,12 @@ class Migrator
             $this->rollback($rec, $fwd, $live, $result, $e->getMessage());
             return;
         }
+        $this->finalize($rec, $live, $result, $opts);
+    }
 
-        // 4. Success: clean up the inactive legacy redirects, apply the billing choice.
+    /** Success: clean up inactive legacy redirect entries and apply the billing choice. */
+    private function finalize($rec, array $live, array $result, array $opts)
+    {
         $warnings = [];
         if ($rec->kind === 'parked') {
             foreach ($live['redirects'] as $r) {
@@ -616,8 +701,6 @@ class Migrator
                     $warnings[] = 'Old redirect ' . self::srcOf($r) . ' is inactive but still listed in cPanel > Redirects; delete it there.';
                 }
             }
-        } elseif ($addonRow) {
-            $warnings[] = 'The old document root (' . CpanelLegacy::field($addonRow, ['reldir', 'dir']) . ') was left on disk.';
         }
         if (!empty($result['diffs'])) {
             $warnings[] = 'Accepted differences: ' . implode('; ', $result['diffs']);
@@ -628,9 +711,142 @@ class Migrator
         self::save($rec, [
             'state' => 'migrated',
             'result' => $result,
-            'message' => 'Migrated and verified.' . ($warnings ? ' ' . count($warnings) . ' note(s).' : ''),
+            'message' => 'Migrated and verified' . (!empty($result['in_place']) ? ' (in place, no Apache rebuild).' : '.')
+                . ($warnings ? ' ' . count($warnings) . ' note(s).' : ''),
         ]);
-        Logger::log('migration', $d . ' migrated and verified', 'info', $rec->client_id, $rec->domain_id);
+        Logger::log('migration', $rec->domain . ' migrated and verified', 'info', $rec->client_id, $rec->domain_id);
+    }
+
+    /** Put an addon domain's original files back (the domain itself never left the account). */
+    private function rollbackInPlace($rec, $fwd, array $live, array $result, $reason)
+    {
+        $steps = [];
+        $b = $result['backup'];
+        try {
+            if ($b['htaccess'] !== null) {
+                $this->legacy->writeFile($b['dir'], '.htaccess', $b['htaccess']);
+            } else {
+                $this->legacy->deleteFile($b['dir'], '.htaccess');
+            }
+        } catch (\Throwable $e) {
+            $steps[] = 'Restoring .htaccess failed: ' . $e->getMessage();
+        }
+        try {
+            if ($b['index_php'] !== null) {
+                $this->legacy->writeFile($b['dir'], 'index.php', $b['index_php']);
+            } else {
+                $this->legacy->deleteFile($b['dir'], 'index.php');
+            }
+        } catch (\Throwable $e) {
+            $steps[] = 'Removing the forwarding index.php failed: ' . $e->getMessage();
+        }
+        Capsule::table(Schema::T_DOMAINS)->where('id', $fwd->id)->update(['status' => 'migrating', 'remote_ref' => null, 'keep_default' => null]);
+        try {
+            $this->legacy->restoreEmail($rec->domain, $live);
+        } catch (\Throwable $e) {
+            $steps[] = 'Restoring email routing failed: ' . $e->getMessage();
+        }
+        $this->finishRollback($rec, $live, $result, $reason, $steps, true);
+    }
+
+    private function finishRollback($rec, array $live, array $result, $reason, array $steps, $waitForOld)
+    {
+        list($back, $waited) = $waitForOld
+            ? $this->awaitOld($rec->domain, $live)
+            : [$this->probeAll($rec->domain, self::probePaths($live['redirects'])), 0];
+        $diffs = self::compare($live['probes'], $back);
+        $result['rollback_waited_seconds'] = $waited;
+        $result['rollback'] = $back;
+        $result['rollback_steps'] = $steps;
+        $result['rollback_diffs'] = $diffs;
+        $ok = !$steps && !$diffs;
+        $message = 'Migration failed (' . $reason . '). '
+            . ($ok ? 'The old setup was restored and verified; nothing else changed.'
+                : 'ROLLBACK INCOMPLETE: ' . implode('; ', array_merge($steps, $diffs)) . ' Restore it manually using the snapshot below, then click Re-check.');
+        self::save($rec, ['state' => $ok ? 'rolled_back' : 'rollback_failed', 'result' => $result, 'message' => $message]);
+        if ($ok) {
+            Logger::log('migration', $rec->domain . ': ' . $message, 'warning', $rec->client_id, $rec->domain_id);
+        } else {
+            Logger::error('migration', $rec->domain . ': ' . $message, $rec->client_id, $rec->domain_id);
+        }
+    }
+
+    /**
+     * Finish a parked-domain move that was waiting for Apache.
+     * @return array [bool done, string message]
+     */
+    public function verifyPending($rec)
+    {
+        if ($rec->state !== 'verifying') {
+            return [false, $rec->domain . ': not waiting for verification.'];
+        }
+        $result = self::decode($rec, 'result');
+        $map = self::decode($rec, 'mapping');
+        $live = isset($result['live']) ? $result['live'] : [];
+        $opts = isset($result['opts']) ? $result['opts'] : [];
+        $fwd = $rec->domain_id ? Capsule::table(Schema::T_DOMAINS)->where('domain_id', $rec->domain_id)->first() : null;
+        if (!$fwd || !$live) {
+            self::save($rec, ['state' => 'rollback_failed', 'message' => 'Verification data is missing; check the domain by hand, then use Re-check or Mark restored.']);
+            return [false, $rec->domain . ': verification data missing.'];
+        }
+        $probes = $this->probeAll($rec->domain, self::probePaths($live['redirects']));
+        if (!self::servedByModule($probes)) {
+            $since = isset($result['provisioned_at']) ? strtotime($result['provisioned_at']) : time();
+            $minutes = (int) floor((time() - $since) / 60);
+            if ($minutes >= 30 && empty($result['alerted'])) {
+                $result['alerted'] = true;
+                Logger::error('migration', $rec->domain . ': Apache has still not loaded the change after ' . $minutes
+                    . ' minutes. Check WHM (rebuildhttpdconf / restartsrv_httpd).', $rec->client_id, $rec->domain_id);
+            }
+            self::save($rec, ['result' => $result, 'message' => 'Still waiting for cPanel to reload Apache (' . $minutes . ' min). Checked ' . date('H:i') . '.']);
+            return [false, $rec->domain . ': Apache has not loaded the change yet.'];
+        }
+        $diffs = array_merge(
+            self::compare($live['probes'], $probes),
+            $this->verifyEmail($rec->domain, $map, isset($result['keep_default']) ? $result['keep_default'] : null)
+        );
+        $result['after'] = $probes;
+        $result['diffs'] = $diffs;
+        if ($diffs && empty($opts['accept_diff'])) {
+            $this->rollback($rec, $fwd, $live, $result, 'Verification failed: ' . implode('; ', array_slice($diffs, 0, 5)));
+            $rec = self::reload($rec);
+            return [false, $rec->domain . ': ' . $rec->message];
+        }
+        $this->finalize($rec, $live, $result, $opts);
+        return [true, $rec->domain . ': migrated and verified.'];
+    }
+
+    /** Called from the WHMCS cron: finish waiting moves without holding any request open. */
+    public static function verifyPendingAll($limit = 25)
+    {
+        $rows = Capsule::table(Schema::T_MIGRATION)->where('state', 'verifying')->orderBy('updated_at')->limit($limit)->get()->all();
+        $byServer = [];
+        foreach ($rows as $rec) {
+            $byServer[$rec->server_id][] = $rec;
+        }
+        foreach ($byServer as $serverId => $recs) {
+            try {
+                $m = self::forServer($serverId);
+            } catch (\Throwable $e) {
+                continue;
+            }
+            foreach ($recs as $rec) {
+                try {
+                    $m->verifyPending($rec);
+                } catch (\Throwable $e) {
+                    Logger::log('migration', $rec->domain . ': verification error: ' . $e->getMessage(), 'error', $rec->client_id, $rec->domain_id);
+                }
+            }
+        }
+    }
+
+    public static function waitSeconds()
+    {
+        if (self::$wait !== null) {
+            return (int) self::$wait;
+        }
+        $s = Settings::int('migration_wait');
+        return $s > 0 ? $s : 120;
     }
 
     private static function pause()
@@ -678,7 +894,7 @@ class Migrator
             if (self::servedByModule($probes)) {
                 return [$probes, time() - $start, true];
             }
-            if (time() - $start >= self::$wait) {
+            if (time() - $start >= self::waitSeconds()) {
                 return [$probes, time() - $start, false];
             }
             self::pause();
@@ -698,7 +914,7 @@ class Migrator
             if (!self::compare($live['probes'], $probes) && !self::anyServedByModule($probes)) {
                 return [$probes, time() - $start];
             }
-            if (time() - $start >= self::$wait) {
+            if (time() - $start >= self::waitSeconds()) {
                 return [$probes, time() - $start];
             }
             self::pause();
@@ -742,6 +958,9 @@ class Migrator
      */
     public function recheck($rec)
     {
+        if ($rec->state === 'verifying') {
+            return $this->verifyPending($rec);
+        }
         if (!in_array($rec->state, ['rollback_failed', 'rolled_back', 'failed'], true)) {
             return [false, $rec->domain . ': only failed or rolled-back domains can be re-checked.'];
         }
@@ -826,7 +1045,7 @@ class Migrator
         return $diffs;
     }
 
-    private function verifyEmail($d, array $map)
+    private function verifyEmail($d, array $map, $keepDefault = null)
     {
         $diffs = [];
         $expected = [];
@@ -850,6 +1069,12 @@ class Migrator
         $df = $this->legacy->domainForwarder($d);
         if ((string) $df !== (string) $map['domain_forward']) {
             $diffs[] = 'Domain email forwarder is "' . $df . '", expected "' . $map['domain_forward'] . '"';
+        }
+        if ($keepDefault !== null && $keepDefault !== '') {
+            $now = $this->legacy->defaultAddress($d);
+            if ($now !== $keepDefault) {
+                $diffs[] = 'Unrouted mail goes to "' . $now . '", expected "' . $keepDefault . '" (kept as before)';
+            }
         }
         if (!empty($map['catchall'])) {
             $now = strtolower($this->legacy->defaultAddress($d));
@@ -883,24 +1108,8 @@ class Migrator
         } catch (\Throwable $e) {
             $steps[] = 'Restoring email routing failed: ' . $e->getMessage();
         }
-        list($back, $waited) = $reattached
-            ? $this->awaitOld($rec->domain, $live)
-            : [$this->probeAll($rec->domain, self::probePaths($live['redirects'])), 0];
-        $diffs = self::compare($live['probes'], $back);
-        $result['rollback_waited_seconds'] = $waited;
-        $result['rollback'] = $back;
-        $result['rollback_steps'] = $steps;
-        $result['rollback_diffs'] = $diffs;
-        $ok = !$steps && !$diffs;
-        $message = 'Migration failed (' . $reason . '). '
-            . ($ok ? 'The old setup was restored and verified; nothing else changed.'
-                : 'ROLLBACK INCOMPLETE: ' . implode('; ', array_merge($steps, $diffs)) . ' Restore it manually using the snapshot below.');
-        self::save($rec, ['state' => $ok ? 'rolled_back' : 'rollback_failed', 'result' => $result, 'message' => $message]);
-        if ($ok) {
-            Logger::log('migration', $rec->domain . ': ' . $message, 'warning', $rec->client_id, $rec->domain_id);
-        } else {
-            Logger::error('migration', $rec->domain . ': ' . $message, $rec->client_id, $rec->domain_id);
-        }
+        Capsule::table(Schema::T_DOMAINS)->where('id', $fwd->id)->update(['keep_default' => null]);
+        $this->finishRollback($rec, $live, $result, $reason, $steps, $reattached);
     }
 
     private function applyBilling($rec, $billing, array &$warnings)

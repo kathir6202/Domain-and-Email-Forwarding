@@ -153,6 +153,18 @@ add_hook('DailyCronJob', 1, function ($vars) {
     }
 });
 
+// Migration wizard: finish moves that were waiting for cPanel to reload Apache (every cron run, no waiting).
+add_hook('AfterCronJob', 1, function ($vars) {
+    try {
+        if (Capsule::schema()->hasTable(Schema::T_MIGRATION)
+            && Capsule::table(Schema::T_MIGRATION)->where('state', 'verifying')->exists()) {
+            \SeekaHost\Forwarding\Migration\Migrator::verifyPendingAll();
+        }
+    } catch (\Throwable $e) {
+        Logger::log('migration', 'Verification cron: ' . $e->getMessage(), 'error', null, null, 'system');
+    }
+});
+
 // Domain deleted in WHMCS: clean up server and module data (cron retries if the server is unreachable).
 add_hook('DomainDelete', 1, function ($vars) {
     try {

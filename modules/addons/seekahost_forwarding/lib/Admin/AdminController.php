@@ -19,7 +19,7 @@ class AdminController
     const PER_PAGE = 50;
     const STATUSES = ['pending', 'active', 'error', 'suspended', 'disabled', 'migrating'];
     const MIGRATION_STATES = [
-        'discovered' => 'default', 'scanned' => 'info', 'imported' => 'primary', 'migrated' => 'success',
+        'discovered' => 'default', 'scanned' => 'info', 'imported' => 'primary', 'verifying' => 'info', 'migrated' => 'success',
         'failed' => 'warning', 'rolled_back' => 'warning', 'rollback_failed' => 'danger', 'skipped' => 'default',
     ];
 
@@ -839,13 +839,22 @@ class AdminController
                 if (!$ids) {
                     Validator::fail('Select the imported domains to move.');
                 }
+                $migrator = Migrator::forServer($serverId);
+                // Pre-flight once per Move run, and only when parked domains need a new addon domain.
+                $kinds = Capsule::table(Schema::T_MIGRATION)->whereIn('id', $ids)->where('state', '!=', 'migrated')->pluck('kind')->all();
+                if (in_array('parked', $kinds, true)) {
+                    $note = $migrator->preflight();
+                    if ($note !== '') {
+                        $this->flash('error', $note);
+                    }
+                }
                 if ($billing === 'all') {
                     Migrator::setAccessModeAll();
                 }
                 $_SESSION['shfwd_mig_queue'] = [
                     'server' => $serverId,
                     'ids' => $ids,
-                    'opts' => ['billing' => $billing, 'accept_diff' => !empty($in['accept_diff'])],
+                    'opts' => ['billing' => $billing, 'accept_diff' => !empty($in['accept_diff']), 'keep_default' => !empty($in['keep_default'])],
                     'size' => max(1, min(5, (int) (isset($in['batch']) ? $in['batch'] : 1))),
                 ];
                 Logger::log('migration', 'Move started for ' . count($ids) . ' domain(s), billing: ' . $billing);
@@ -855,16 +864,7 @@ class AdminController
                 if (!$q) {
                     break;
                 }
-                $migrator = Migrator::forServer($q['server']);
-                try {
-                    $left = $migrator->moveBatch($q['ids'], $q['opts'], $q['size']);
-                } catch (\InvalidArgumentException $e) {
-                    unset($_SESSION['shfwd_mig_queue']);
-                    throw $e;
-                }
-                if ($migrator->notice !== '') {
-                    $this->flash('error', $migrator->notice);
-                }
+                $left = Migrator::forServer($q['server'])->moveBatch($q['ids'], $q['opts'], $q['size']);
                 if ($left) {
                     $_SESSION['shfwd_mig_queue']['ids'] = $left;
                     $back['continue'] = 'move';
@@ -984,13 +984,17 @@ class AdminController
             . '<button class="btn btn-default" name="op" value="cancel">Cancel import</button> '
             . '<button class="btn btn-default" name="op" value="rescan">Re-scan</button> '
             . '<button class="btn btn-default" name="op" value="skip">Skip</button></p>'
-            . '<p><strong>Rollback failed?</strong> Restore the domain (see its snapshot), then: '
+            . '<p><strong>Verifying or rollback failed?</strong> <em>Verifying</em> rows finish automatically with the WHMCS cron; Re-check finishes them now. '
+            . 'For <em>rollback failed</em>, restore the domain (see its snapshot), then: '
             . '<button class="btn btn-info" name="op" value="recheck">Re-check</button> '
             . '<button class="btn btn-warning" name="op" value="mark_restored" onclick="return confirm(\'Only use this after you have confirmed the old setup works again. Mark the selected rollback-failed domains as restored?\')">Mark restored</button> '
             . '<small class="text-muted">Re-check compares the live setup with the snapshot; Mark restored is a manual override.</small></p>'
             . '<hr><p><strong>4. Move imported domains</strong> &mdash; billing for migrated domains:</p>' . $billing
             . '<p style="margin-top:8px">Domains per batch <input type="number" name="batch" value="1" min="1" max="5" class="form-control" style="display:inline-block;width:80px"> '
-            . '<small class="text-muted">Each domain can take up to ' . (int) Migrator::$wait . ' s while cPanel rebuilds Apache; a pre-flight test runs before every batch.</small> '
+            . '<small class="text-muted">Addon domains are switched in place (no Apache rebuild). Parked domains wait up to ' . (int) Migrator::waitSeconds()
+            . ' s for cPanel to reload Apache, then continue as <em>verifying</em>. A pre-flight test runs once per Move when parked domains are included.</small></p>'
+            . '<p><label style="font-weight:normal"><input type="checkbox" name="keep_default" value="1" checked> Keep unrouted mail as before '
+            . '(mail to unknown addresses keeps going where it goes today, e.g. the account mailbox)</label></p><p>'
             . '<label style="font-weight:normal"><input type="checkbox" name="accept_diff" value="1"> keep the new setup even if the verification shows differences (not recommended)</label></p>'
             . '<button class="btn btn-success" name="op" value="move" onclick="return confirm(\'Move the selected imported domains now? Each one is verified and rolled back automatically if anything differs.\')">4. Move selected</button>'
             . '</div></form>';

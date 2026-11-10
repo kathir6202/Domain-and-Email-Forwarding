@@ -53,7 +53,7 @@ foreach (['dashboard', 'domains', 'domain', 'servers', 'server', 'tlds', 'api', 
     catch (Throwable $e) { $errors++; echo "ADMIN $action threw: " . $e->getMessage() . ' @' . $e->getFile() . ':' . $e->getLine() . "\n"; }
     $html = ob_get_clean();
     $expect = ['dashboard' => ['Recent Activity'], 'domains' => ['example.com', 'Manage'], 'domain' => ['URL Forwarders', 'info@example.com', 'all@b.com'],
-        'servers' => ['S1'], 'server' => ['Verify SSL Certificate'], 'tlds' => ['.com', '.net', 'Automatic action'], 'api' => ['api.php', 't1'], 'migration' => ['Discover domains', 'Re-check', 'Mark restored', 'old-&lt;x&gt;.com', 'Issue &lt;x&gt;', '4. Move selected', 'Planned rules'], 'logs' => ['url_add']];
+        'servers' => ['S1'], 'server' => ['Verify SSL Certificate'], 'tlds' => ['.com', '.net', 'Automatic action'], 'api' => ['api.php', 't1'], 'migration' => ['Discover domains', 'Re-check', 'Mark restored', 'Keep unrouted mail as before', 'old-&lt;x&gt;.com', 'Issue &lt;x&gt;', '4. Move selected', 'Planned rules'], 'logs' => ['url_add']];
     check($html, "admin:$action", $expect[$action]);
 }
 $_GET = $_REQUEST = ['module' => 'seekahost_forwarding', 'action' => 'domains', 'q' => 'Ann', 'status' => 'active'];

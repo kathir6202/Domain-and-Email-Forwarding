@@ -182,6 +182,43 @@ class CpanelLegacy
         return $label;
     }
 
+    private function abs($dir)
+    {
+        return strpos($dir, '/') === 0 ? rtrim($dir, '/') : rtrim($this->cp->home(), '/') . '/' . trim($dir, '/');
+    }
+
+    /** @return string|null content of a file in the account (dir relative to home), null if missing */
+    public function readFile($dir, $file)
+    {
+        return $this->cp->readFile($this->abs($dir), $file);
+    }
+
+    public function writeFile($dir, $file, $content)
+    {
+        $this->cp->call(3, 'Fileman', 'save_file_content', ['dir' => $this->abs($dir), 'file' => $file, 'content' => $content]);
+    }
+
+    /** Delete a file in the account (no error when it is already gone). */
+    public function deleteFile($dir, $file)
+    {
+        $path = $this->abs($dir) . '/' . $file;
+        if ($this->cp->readFile($this->abs($dir), $file) === null) {
+            return;
+        }
+        $last = null;
+        foreach (['unlink', 'trash'] as $op) {
+            try {
+                $this->cp->call(2, 'Fileman', 'fileop', ['op' => $op, 'sourcefiles' => $path, 'doubledecode' => 0]);
+                if ($this->cp->readFile($this->abs($dir), $file) === null) {
+                    return;
+                }
+            } catch (\Throwable $e) {
+                $last = $e;
+            }
+        }
+        throw new \RuntimeException('Could not delete ' . $path . ($last ? ': ' . $last->getMessage() : ''));
+    }
+
     /** Best effort: remove the FTP account cPanel creates with an addon domain (never its files). */
     public function deleteFtpAccount($label)
     {
@@ -239,19 +276,7 @@ class CpanelLegacy
         }
         $raw = isset($snap['default_address']) ? (string) $snap['default_address'] : '';
         if ($raw !== '' && $this->defaultAddress($domain) !== $raw) {
-            $params = ['domain' => $domain];
-            if (filter_var($raw, FILTER_VALIDATE_EMAIL)) {
-                $params += ['fwdopt' => 'fwd', 'fwdemail' => $raw];
-            } elseif ($raw === ':blackhole:') {
-                $params += ['fwdopt' => 'blackhole'];
-            } elseif (strpos($raw, ':fail:') === 0) {
-                $params += ['fwdopt' => 'fail', 'failmsgs' => trim(substr($raw, 6))];
-            } elseif (strpos($raw, '|') === 0) {
-                $params += ['fwdopt' => 'pipe', 'pipefwd' => ltrim(substr($raw, 1))];
-            } else {
-                $params += ['fwdopt' => 'system', 'fwdsystem' => $raw];
-            }
-            $this->cp->call(3, 'Email', 'set_default_address', $params);
+            $this->cp->setDefaultAddressRaw($domain, $raw);
         }
     }
 }

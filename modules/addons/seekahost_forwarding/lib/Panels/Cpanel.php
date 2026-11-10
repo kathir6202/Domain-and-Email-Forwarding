@@ -239,6 +239,9 @@ class Cpanel extends AbstractPanel
     public function deployFiles($domain, array $ref, array $files)
     {
         $dir = $this->homeDir() . '/' . $ref['dir'];
+        if (isset($files['.htaccess'])) {
+            $files['.htaccess'] = self::keepCpanelBlocks($files['.htaccess'], $this->readFile($dir, '.htaccess'));
+        }
         foreach ($files as $name => $content) {
             $this->cpanel(3, 'Fileman', 'save_file_content', [
                 'dir' => $dir,
@@ -246,6 +249,66 @@ class Cpanel extends AbstractPanel
                 'content' => $content,
             ]);
         }
+    }
+
+    /** @return string|null file content, or null when the file does not exist */
+    public function readFile($absDir, $file)
+    {
+        try {
+            $data = $this->cpanel(3, 'Fileman', 'get_file_content', ['dir' => $absDir, 'file' => $file]);
+        } catch (\RuntimeException $e) {
+            if (preg_match('/no such file|not exist|cannot open|failed to open|not found|could not open|enoent/i', $e->getMessage())) {
+                return null;
+            }
+            throw $e;
+        }
+        return isset($data['content']) ? (string) $data['content'] : '';
+    }
+
+    public function home()
+    {
+        return $this->homeDir();
+    }
+
+    /**
+     * cPanel writes its own blocks (MultiPHP handler, php ini directives) into .htaccess files.
+     * Keep them when replacing the file, so PHP keeps working exactly as configured in cPanel.
+     */
+    public static function keepCpanelBlocks($ours, $existing)
+    {
+        if ($existing === null || $existing === '') {
+            return $ours;
+        }
+        $keep = [];
+        $patterns = [
+            '/# BEGIN cPanel-generated php ini directives, do not edit.*?# END cPanel-generated php ini directives, do not edit/s',
+            '/# php -- BEGIN cPanel-generated handler, do not edit.*?# php -- END cPanel-generated handler, do not edit/s',
+        ];
+        foreach ($patterns as $re) {
+            if (preg_match($re, $existing, $m) && strpos($ours, $m[0]) === false) {
+                $keep[] = $m[0];
+            }
+        }
+        return $keep ? rtrim($ours) . "\n\n" . implode("\n\n", $keep) . "\n" : $ours;
+    }
+
+    /** Set a domain's default address from its raw cPanel value (user@x, account name, :fail: msg, :blackhole:, |pipe). */
+    public function setDefaultAddressRaw($domain, $raw)
+    {
+        $raw = trim((string) $raw);
+        $params = ['domain' => $domain];
+        if (filter_var($raw, FILTER_VALIDATE_EMAIL)) {
+            $params += ['fwdopt' => 'fwd', 'fwdemail' => $raw];
+        } elseif ($raw === ':blackhole:') {
+            $params += ['fwdopt' => 'blackhole'];
+        } elseif (strpos($raw, ':fail:') === 0) {
+            $params += ['fwdopt' => 'fail', 'failmsgs' => trim(substr($raw, 6))];
+        } elseif (strpos($raw, '|') === 0) {
+            $params += ['fwdopt' => 'pipe', 'pipefwd' => ltrim(substr($raw, 1))];
+        } else {
+            $params += ['fwdopt' => 'system', 'fwdsystem' => $raw];
+        }
+        $this->cpanel(3, 'Email', 'set_default_address', $params);
     }
 
     /** @return string[] current destinations of $address on the server */

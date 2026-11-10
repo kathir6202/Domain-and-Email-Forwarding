@@ -11,13 +11,13 @@ class FakeCpanel extends \SeekaHost\Forwarding\Panels\Cpanel
     public static $home;
     public static $failOn = [];
     public static $calls = [];
-    /** Simulated Apache rebuild delay: stale answers per changed domain. */
+    /** Simulated Apache rebuild delay in seconds after a domain is added or removed. */
     public static $lag = 0;
 
     private static function changed($domain)
     {
         if (self::$lag > 0) {
-            $GLOBALS['shfwd_stale'][strtolower($domain)] = self::$lag;
+            $GLOBALS['shfwd_stale'][strtolower($domain)] = microtime(true) + self::$lag;
         }
     }
 
@@ -134,6 +134,18 @@ class FakeCpanel extends \SeekaHost\Forwarding\Panels\Cpanel
                 break;
             case 'Email::set_default_address':
                 $st['default'][$p['domain']] = $p['fwdopt'] === 'fwd' ? $p['fwdemail'] : ($p['fwdopt'] === 'blackhole' ? ':blackhole:' : ($p['fwdopt'] === 'system' ? $p['fwdsystem'] : ':fail: ' . (isset($p['failmsgs']) ? $p['failmsgs'] : '')));
+                break;
+            case 'Fileman::get_file_content':
+                $f = rtrim($p['dir'], '/') . '/' . $p['file'];
+                if (!is_file($f)) {
+                    throw new RuntimeException('Failed to open “' . $f . '”: No such file or directory');
+                }
+                $out = ['content' => file_get_contents($f), 'dir' => $p['dir'], 'filename' => $p['file']];
+                break;
+            case 'Fileman::fileop':
+                if ($p['op'] === 'unlink' && is_file($p['sourcefiles'])) {
+                    unlink($p['sourcefiles']);
+                }
                 break;
             case 'Fileman::save_file_content':
                 @mkdir($p['dir'], 0777, true);

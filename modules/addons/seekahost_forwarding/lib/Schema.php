@@ -68,6 +68,7 @@ class Schema
                 $t->integer('email_limit')->nullable();
                 $t->string('catchall', 255)->nullable();
                 $t->string('domain_forward', 191)->nullable();
+                $t->string('keep_default', 255)->nullable();
                 $t->text('last_error')->nullable();
                 $t->dateTime('last_sync')->nullable();
                 $t->dateTime('created_at')->nullable();
@@ -195,6 +196,9 @@ class Schema
         });
         $add(self::T_DOMAINS, 'domain_forward', function ($t) {
             $t->string('domain_forward', 191)->nullable();
+        });
+        $add(self::T_DOMAINS, 'keep_default', function ($t) {
+            $t->string('keep_default', 255)->nullable();
         });
         $add(self::T_URL, 'www_mode', function ($t) {
             $t->string('www_mode', 10)->default('both');

@@ -252,6 +252,11 @@ class Service
             self::remote($fwd, 'sync_catchall', function () use ($panel, $fwd, $ref) {
                 $panel->setCatchAll($fwd->domain, $ref, $fwd->catchall);
             });
+        } elseif (!empty($fwd->keep_default) && method_exists($panel, 'setDefaultAddressRaw')) {
+            // Migrated domain: unrouted mail keeps going where it went before (e.g. the account mailbox).
+            self::remote($fwd, 'sync_default_address', function () use ($panel, $fwd) {
+                $panel->setDefaultAddressRaw($fwd->domain, $fwd->keep_default);
+            });
         } else {
             try {
                 // Never let unrouted mail land in the shared forwarding account.
@@ -664,7 +669,8 @@ class Service
             return;
         }
         $previous = $fwd->catchall;
-        self::touch($fwd, ['catchall' => $dest]);
+        // The customer now manages unrouted mail themselves.
+        self::touch($fwd, ['catchall' => $dest, 'keep_default' => null]);
         $fwd = self::reload($fwd);
         try {
             if (self::isPlaced($fwd)) {

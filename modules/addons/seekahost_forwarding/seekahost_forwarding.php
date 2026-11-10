@@ -116,6 +116,13 @@ function seekahost_forwarding_config()
                 'Type' => 'yesno',
                 'Description' => 'Allow token-authenticated API access (manage tokens under Addons &gt; this module &gt; API).',
             ],
+            'migration_wait' => [
+                'FriendlyName' => 'Migration: Apache Wait (seconds)',
+                'Type' => 'text',
+                'Size' => '5',
+                'Default' => '120',
+                'Description' => 'How long the migration wizard waits for cPanel to reload Apache before a parked domain is left in "verifying" (finished by the cron).',
+            ],
             'delete_on_deactivate' => [
                 'FriendlyName' => 'Delete Data on Deactivate',
                 'Type' => 'yesno',

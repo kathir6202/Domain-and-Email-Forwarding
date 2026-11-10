@@ -104,21 +104,18 @@ The **Migration** tab moves domains that an older forwarding module set up on a 
    - switch Access Mode to *All active domains*
    - change nothing
 
-   Then click **Move selected**. Domains are processed in batches; the default is one domain per batch.
+   Leave **Keep unrouted mail as before** ticked (the default) so mail to unknown addresses keeps going exactly where it goes today, for example the account mailbox. Untick it to reject unknown addresses. Then click **Move selected**.
 
-   Before each batch, a **pre-flight test** creates and removes a throwaway addon domain. If cPanel refuses because of an account limit, the move stops with a clear message and no domain is touched.
+   For each domain the wizard first checks the server still matches the scan, and stops without changes if it doesn't. It then works differently for the two kinds of domain:
 
-   For each domain the wizard then:
-   1. checks the server still matches the scan, and stops without changes if it doesn't
-   2. detaches the old parked or addon domain, leaving its `.htaccess` redirects on disk untouched
-   3. creates the domain in this module with all its rules
-   4. **waits until cPanel has rebuilt Apache**, which can take up to 150 seconds. It recognises the new setup by a marker header that is only sent to its own check requests.
-   5. compares every redirect the domain answered before, and the email routing, with the new setup
-   6. if anything differs, removes the new setup and re-attaches the old domain with its exact original internal name and folder. It restores the email routing from the snapshot, then waits for Apache again and verifies the restore.
+   - **Addon domains are switched in place.** The domain never leaves the account, so Apache isn't rebuilt and there is no downtime. The wizard saves the folder's `.htaccess` and `index.php`, then writes the module's forwarding files into the same folder, keeping cPanel's own PHP handler and ini blocks. It verifies immediately. A rollback writes the saved files back.
+   - **Parked domains are unparked and added as addon domains**, which needs an Apache rebuild. A **pre-flight test** (create and remove a throwaway addon domain) runs once per Move when parked domains are included, and stops on account limits before anything is touched. Email routing is verified straight away. The wizard then waits up to *Migration: Apache Wait* seconds (a module setting, default 120). If Apache hasn't reloaded by then, the domain stays **verifying**, with the new setup kept rather than rolled back. Every WHMCS cron run, or **Re-check**, finishes the verification: a match becomes *migrated*, and a real difference rolls back. Admins are alerted if Apache still hasn't reloaded after 30 minutes.
 
-   After a successful move, the old cPanel redirect entries are deleted.
+   In both cases the wizard compares every redirect the domain answered before, plus the email routing, with the new setup. It recognises the new setup by a marker header that is only sent to its own check requests. Only a real difference triggers a rollback.
+
 8. Review the results:
    - **migrated**: moved and verified
+   - **verifying**: a parked domain is moved and waiting for Apache; it finishes automatically
    - **rolled back**: the old setup was restored and verified
    - **failed**: nothing was changed
    - **rollback failed**: an admin alert is sent and the full snapshot is shown so you can restore it by hand. After restoring, click **Re-check**, which compares the live setup with the snapshot and sets the row to *rolled back*. Or click **Mark restored** as a manual override. The domain can then be moved again.
@@ -126,7 +123,7 @@ The **Migration** tab moves domains that an older forwarding module set up on a 
    The old module is never modified. Deactivate it yourself once you are satisfied.
 
 Notes:
-- Unrouted mail that was delivered to the account's own mailbox is rejected after migration (shown as an issue during the scan).
+- Unrouted mail keeps its current destination when **Keep unrouted mail as before** is ticked. A customer who later sets their own catch-all takes over from it.
 - Parked domains without any forwarders show the module's parking page.
 
 ## Why it is safe across WHMCS updates
