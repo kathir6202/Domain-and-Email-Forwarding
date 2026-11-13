@@ -187,6 +187,7 @@ Each server needs **one dedicated hosting account**. Every forwarded domain is a
   - Optionally set **Let's Encrypt Email** in the module settings.
 - **Connection settings:** turn on **FTP over TLS** and **Verify SSL Certificate** whenever your servers support them. Both are on by default for new servers.
 - **DNS:** **Web IP** and **Mail Host** are shown to clients as the A and MX records their domain needs. Clients set these in your DNS Management.
+- **Nameservers (optional):** when **Nameserver 1** and **Nameserver 2** are filled in, clients see them as a second option. They can either add the A/MX records (option 1) or point the domain to these nameservers (option 2). Each option shows a live OK / Not detected status.
 
 ## Domain status
 

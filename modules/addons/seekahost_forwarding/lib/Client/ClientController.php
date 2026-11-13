@@ -267,6 +267,7 @@ class ClientController
             'migrating' => $fwd->status === 'migrating',
             'maxDestinations' => Settings::int('max_destinations'),
             'dns' => Settings::on('show_dns') ? DnsCheck::records($fwd->domain, $server) : [],
+            'nameservers' => Settings::on('show_dns') ? DnsCheck::nameservers($fwd->domain, $server) : [],
             'serverReady' => (bool) $server,
             'editUrl' => $editUrl,
             'editEmail' => $editEmail,

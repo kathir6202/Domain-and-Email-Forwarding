@@ -205,6 +205,17 @@ class AdminController
         foreach (['name', 'hostname', 'username', 'account', 'web_ip', 'mail_host', 'ftp_host', 'ftp_user'] as $f) {
             $data[$f] = trim(isset($in[$f]) ? (string) $in[$f] : '');
         }
+        foreach (['ns1' => 'Nameserver 1', 'ns2' => 'Nameserver 2'] as $f => $label) {
+            $ns = trim(isset($in[$f]) ? (string) $in[$f] : '');
+            if ($ns !== '') {
+                try {
+                    $ns = Validator::domain($ns);
+                } catch (\InvalidArgumentException $e) {
+                    Validator::fail($label . ' must be a host name such as ns1.example.com.');
+                }
+            }
+            $data[$f] = $ns;
+        }
         if ($data['name'] === '' || $data['hostname'] === '' || $data['account'] === '') {
             Validator::fail('Name, hostname and account are required.');
         }
@@ -685,6 +696,8 @@ class AdminController
             . $row('Account', $text('account', $v('account')), 'cPanel username / DirectAdmin username / Plesk subscription (webspace) domain that will hold the forwarded domains.')
             . $row('Web IP (A record)', $text('web_ip', $v('web_ip')), 'Shown to clients as the required A record; also used before requesting SSL.')
             . $row('Mail Host (MX)', $text('mail_host', $v('mail_host')), 'Shown to clients as the required MX record.')
+            . $row('Nameserver 1', $text('ns1', $v('ns1'), 'text', 'ns1.example.com'), 'Optional. Shown to clients as an alternative to the A/MX records: they can point the domain to these nameservers instead.')
+            . $row('Nameserver 2', $text('ns2', $v('ns2'), 'text', 'ns2.example.com'), 'Optional.')
             . $row('FTP Host', $text('ftp_host', $v('ftp_host')), 'DirectAdmin and Plesk only (file upload). Empty = hostname.')
             . $row('FTP Port', $text('ftp_port', $v('ftp_port'), 'number'), 'Empty = 21.')
             . $row('FTP Username', $text('ftp_user', $v('ftp_user')), 'Empty = Account. For Plesk, the subscription\'s system user.')

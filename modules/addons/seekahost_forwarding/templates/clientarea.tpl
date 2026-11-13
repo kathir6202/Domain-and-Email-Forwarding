@@ -251,10 +251,17 @@
     {/if}
 
     {* ---------------------------------------------------------- DNS / SSL *}
-    {if $dns}
+    {if $dns || $nameservers}
     <div class="shfwd-box">
         <h3>DNS Records</h3>
+        {if $nameservers && $dns}
+        <p class="shfwd-muted">For forwarding to work, use <strong>one</strong> of the two options below. Changes can take a few hours to propagate.</p>
+        <h4>Option 1: Point these records</h4>
+        <p class="shfwd-muted">Keep your current nameservers and add these records from DNS Management.</p>
+        {elseif $dns}
         <p class="shfwd-muted">For forwarding to work, your domain must have these records. Update them from DNS Management if needed. Changes can take a few hours to propagate.</p>
+        {/if}
+        {if $dns}
         <table class="table">
             <thead><tr><th>Type</th><th>Host</th><th>Value</th><th>Status</th></tr></thead>
             <tbody>
@@ -266,6 +273,23 @@
             {/foreach}
             </tbody>
         </table>
+        {/if}
+        {if $nameservers}
+        <h4>{if $dns}Option 2: {/if}Use our nameservers</h4>
+        <p class="shfwd-muted">{if $dns}Instead of the records above, you{else}You{/if} can set your domain's nameservers to the following. Our nameservers then answer for your domain's website and email.
+            <a href="clientarea.php?action=domaindetails&id={$domainId}#tabNameservers">Change nameservers</a></p>
+        <table class="table">
+            <thead><tr><th>Nameserver</th><th>Value</th><th>Status</th></tr></thead>
+            <tbody>
+            {foreach $nameservers as $n}
+                <tr>
+                    <td>{$n.label|escape}</td><td>{$n.value|escape}</td>
+                    <td>{if $n.ok}<span class="shfwd-badge shfwd-ok">OK</span>{else}<span class="shfwd-badge shfwd-bad">Not detected</span>{/if}</td>
+                </tr>
+            {/foreach}
+            </tbody>
+        </table>
+        {/if}
     </div>
     {/if}
 

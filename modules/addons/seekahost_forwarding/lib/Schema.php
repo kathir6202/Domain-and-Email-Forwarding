@@ -39,6 +39,8 @@ class Schema
                 $t->string('account', 255)->default('');
                 $t->string('web_ip', 64)->default('');
                 $t->string('mail_host', 255)->default('');
+                $t->string('ns1', 255)->default('');
+                $t->string('ns2', 255)->default('');
                 $t->string('ftp_host', 255)->default('');
                 $t->integer('ftp_port')->nullable();
                 $t->string('ftp_user', 100)->default('');
@@ -185,6 +187,12 @@ class Schema
                 $schema->table($table, $definition);
             }
         };
+        $add(self::T_SERVERS, 'ns1', function ($t) {
+            $t->string('ns1', 255)->default('');
+        });
+        $add(self::T_SERVERS, 'ns2', function ($t) {
+            $t->string('ns2', 255)->default('');
+        });
         $add(self::T_SERVERS, 'verify_ssl', function ($t) {
             $t->boolean('verify_ssl')->default(0);
         });

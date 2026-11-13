@@ -22,7 +22,7 @@ Capsule::table('tblclients')->insert(['id' => 1, 'firstname' => 'Ann', 'lastname
 Capsule::table('tbldomains')->insert(['id' => 10, 'userid' => 1, 'domain' => 'example.com', 'status' => 'Active', 'emailforwarding' => 1]);
 Capsule::table('tbldomains')->insert(['id' => 11, 'userid' => 1, 'domain' => 'noaddon.com', 'status' => 'Active', 'emailforwarding' => 0]);
 Capsule::table('tbldomainpricing')->insert([['extension' => '.com'], ['extension' => '.net']]);
-Capsule::table(Schema::T_SERVERS)->insert(['name' => 'S1', 'type' => 'cpanel', 'hostname' => 'h', 'username' => 'root', 'account' => 'fwd', 'web_ip' => '203.0.113.5', 'mail_host' => 'mail.h', 'is_default' => 1, 'active' => 1]);
+Capsule::table(Schema::T_SERVERS)->insert(['name' => 'S1', 'type' => 'cpanel', 'hostname' => 'h', 'username' => 'root', 'account' => 'fwd', 'web_ip' => '203.0.113.5', 'mail_host' => 'mail.h', 'ns1' => 'ns1.example-host.com', 'ns2' => 'ns2.example-host.com', 'is_default' => 1, 'active' => 1]);
 $fwd = Service::fwdDomain(Service::domainRow(10));
 Service::saveUrl($fwd, ['source_path' => '/', 'destination' => 'https://dest.com/?a=1&b=2', 'type' => 'masked', 'title' => 'T "q"', 'preserve_query' => 1]);
 Service::saveEmail(Service::reload($fwd), ['local_part' => 'info', 'destinations' => 'a@b.com,c@d.com']);
@@ -53,7 +53,7 @@ foreach (['dashboard', 'domains', 'domain', 'servers', 'server', 'tlds', 'api', 
     catch (Throwable $e) { $errors++; echo "ADMIN $action threw: " . $e->getMessage() . ' @' . $e->getFile() . ':' . $e->getLine() . "\n"; }
     $html = ob_get_clean();
     $expect = ['dashboard' => ['Recent Activity'], 'domains' => ['example.com', 'Manage'], 'domain' => ['URL Forwarders', 'info@example.com', 'all@b.com'],
-        'servers' => ['S1'], 'server' => ['Verify SSL Certificate'], 'tlds' => ['.com', '.net', 'Automatic action'], 'api' => ['api.php', 't1'], 'migration' => ['Discover domains', 'Re-check', 'Mark restored', 'Keep unrouted mail as before', 'Resume', 'Undo', 'old-&lt;x&gt;.com', 'Issue &lt;x&gt;', '4. Move selected', 'Planned rules'], 'logs' => ['url_add']];
+        'servers' => ['S1'], 'server' => ['Verify SSL Certificate', 'Nameserver 1', 'ns2.example-host.com'], 'tlds' => ['.com', '.net', 'Automatic action'], 'api' => ['api.php', 't1'], 'migration' => ['Discover domains', 'Re-check', 'Mark restored', 'Keep unrouted mail as before', 'Resume', 'Undo', 'old-&lt;x&gt;.com', 'Issue &lt;x&gt;', '4. Move selected', 'Planned rules'], 'logs' => ['url_add']];
     check($html, "admin:$action", $expect[$action]);
 }
 $_GET = $_REQUEST = ['module' => 'seekahost_forwarding', 'action' => 'domains', 'q' => 'Ann', 'status' => 'active'];
@@ -75,7 +75,7 @@ $smarty->setCompileDir(sys_get_temp_dir() . '/shfwd_smarty_' . md5($smartyAutolo
 $smarty->enableSecurity();
 $_SESSION['uid'] = 1;
 $cases = [
-    'manage' => [['id' => 10], ['Domain (URL) Forwarding', 'info@example.com', 'all@b.com', 'Masked (Frame)', 'Request SSL', 'www. Handling', '203.0.113.5']],
+    'manage' => [['id' => 10], ['Domain (URL) Forwarding', 'info@example.com', 'all@b.com', 'Masked (Frame)', 'Request SSL', 'www. Handling', '203.0.113.5', 'Option 1: Point these records', 'Option 2: Use our nameservers', 'ns1.example-host.com', 'ns2.example-host.com', 'Change nameservers']],
     'edit_url' => [['id' => 10, 'edit_url' => 1], ['Edit URL Forwarder', 'T &quot;q&quot;']],
     'edit_email' => [['id' => 10, 'edit_email' => 1], ['Edit Email Forwarder', 'a@b.com, c@d.com']],
     'list' => [[], ['Manage Forwarding']],

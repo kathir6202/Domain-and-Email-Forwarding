@@ -19,6 +19,37 @@ class DnsCheck
     }
 
     /**
+     * The server's nameservers (alternative to the A/MX records), with live status.
+     * @return array[] each: label, value, ok
+     */
+    public static function nameservers($domain, $server)
+    {
+        if (!$server) {
+            return [];
+        }
+        $wanted = [];
+        foreach (['ns1', 'ns2'] as $field) {
+            if (!empty($server->$field)) {
+                $wanted[] = strtolower(rtrim(trim($server->$field), '.'));
+            }
+        }
+        if (!$wanted) {
+            return [];
+        }
+        $found = [];
+        foreach ((array) @dns_get_record($domain, DNS_NS) as $rec) {
+            if (isset($rec['target'])) {
+                $found[] = strtolower(rtrim($rec['target'], '.'));
+            }
+        }
+        $rows = [];
+        foreach ($wanted as $i => $ns) {
+            $rows[] = ['label' => 'Nameserver ' . ($i + 1), 'value' => $ns, 'ok' => in_array($ns, $found, true)];
+        }
+        return $rows;
+    }
+
+    /**
      * Records the client must have for forwarding to work, with live status.
      * @return array[] each: type, host, value, ok
      */
