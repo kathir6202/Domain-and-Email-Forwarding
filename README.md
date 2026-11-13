@@ -104,18 +104,22 @@ The **Migration** tab moves domains that an older forwarding module set up on a 
    - switch Access Mode to *All active domains*
    - change nothing
 
+   Every step is a **short request**: the pre-flight test, then one domain per step, and waiting is never done inside a long request. That way web servers such as LiteSpeed never cut a move off. Domains that are still waiting for the web server are finished automatically by the Migration page (every 15 seconds while it's open) and by the WHMCS cron.
+
    Leave **Keep unrouted mail as before** ticked (the default) so mail to unknown addresses keeps going exactly where it goes today, for example the account mailbox. Untick it to reject unknown addresses. Then click **Move selected**.
 
    For each domain the wizard first checks the server still matches the scan, and stops without changes if it doesn't. It then works differently for the two kinds of domain:
 
-   - **Addon domains are switched in place.** The domain never leaves the account, so Apache isn't rebuilt and there is no downtime. The wizard saves the folder's `.htaccess` and `index.php`, then writes the module's forwarding files into the same folder, keeping cPanel's own PHP handler and ini blocks. It verifies immediately. A rollback writes the saved files back.
-   - **Parked domains are unparked and added as addon domains**, which needs an Apache rebuild. A **pre-flight test** (create and remove a throwaway addon domain) runs once per Move when parked domains are included, and stops on account limits before anything is touched. Email routing is verified straight away. The wizard then waits up to *Migration: Apache Wait* seconds (a module setting, default 120). If Apache hasn't reloaded by then, the domain stays **verifying**, with the new setup kept rather than rolled back. Every WHMCS cron run, or **Re-check**, finishes the verification: a match becomes *migrated*, and a real difference rolls back. Admins are alerted if Apache still hasn't reloaded after 30 minutes.
+   - **Addon domains are switched in place**, but only when their folder holds no website files and isn't shared with another domain or the main site. Otherwise the scan blocks them, so nothing is overwritten. The domain never leaves the account, so Apache isn't rebuilt and there is no downtime. The wizard saves the folder's `.htaccess` and `index.php`, then writes the module's forwarding files into the same folder, keeping cPanel's own PHP handler and ini blocks. It verifies immediately. A rollback writes the saved files back.
+   - **Parked domains are unparked and added as addon domains**, which needs an Apache rebuild. A **pre-flight test** (create and remove a throwaway addon domain) runs once per Move when parked domains are included, and stops on account limits before anything is touched. Email routing is verified straight away. The wizard then waits up to *Migration: Web Server Wait* seconds (a module setting, default 10, maximum 20). If Apache hasn't reloaded by then, the domain stays **verifying**, with the new setup kept rather than rolled back. Every WHMCS cron run, or **Re-check**, finishes the verification: a match becomes *migrated*, and a real difference rolls back. Admins are alerted if Apache still hasn't reloaded after 30 minutes.
 
    In both cases the wizard compares every redirect the domain answered before, plus the email routing, with the new setup. It recognises the new setup by a marker header that is only sent to its own check requests. Only a real difference triggers a rollback.
 
 8. Review the results:
    - **migrated**: moved and verified
-   - **verifying**: a parked domain is moved and waiting for Apache; it finishes automatically
+   - **verifying**: moved and waiting for the web server; it finishes automatically
+   - **restoring**: rolled back and waiting for the web server to serve the old setup again; it finishes automatically
+   - **moving** with an **interrupted** badge: the request was cut off part-way. Click **Resume** to finish the move, or **Undo** to put the old setup back. This also works for moves interrupted by older versions.
    - **rolled back**: the old setup was restored and verified
    - **failed**: nothing was changed
    - **rollback failed**: an admin alert is sent and the full snapshot is shown so you can restore it by hand. After restoring, click **Re-check**, which compares the live setup with the snapshot and sets the row to *rolled back*. Or click **Mark restored** as a manual override. The domain can then be moved again.
@@ -124,7 +128,7 @@ The **Migration** tab moves domains that an older forwarding module set up on a 
 
 Notes:
 - Unrouted mail keeps its current destination when **Keep unrouted mail as before** is ticked. A customer who later sets their own catch-all takes over from it.
-- Parked domains without any forwarders show the module's parking page.
+- Parked domains without any forwarders, and any address that no forwarder matches, show the module's parking page. The page is served with status 200 on `/` and 404 on other paths. To keep what visitors saw before, paste the old landing page into **Parking Page HTML**.
 
 ## Why it is safe across WHMCS updates
 

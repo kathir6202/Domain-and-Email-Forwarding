@@ -46,7 +46,23 @@ class ClientController
         if (function_exists('checkContactPermission')) {
             return (bool) checkContactPermission('managedomains', true);
         }
-        \SeekaHost\Forwarding\Logger::log('permission', 'checkContactPermission() is unavailable; access denied', 'error');
+        // Fallback for WHMCS versions without checkContactPermission(): the account owner is always allowed.
+        try {
+            if (class_exists('\WHMCS\Authentication\CurrentUser')) {
+                $current = new \WHMCS\Authentication\CurrentUser();
+                $user = $current->user();
+                $client = $current->client();
+                if ($user && $client && method_exists($client, 'owner')) {
+                    $owner = $client->owner();
+                    if ($owner && (int) $owner->id === (int) $user->id) {
+                        return true;
+                    }
+                }
+            }
+        } catch (\Throwable $e) {
+            // fall through to deny
+        }
+        \SeekaHost\Forwarding\Logger::log('permission', 'Domain permission could not be confirmed for this user; access denied', 'warning');
         return false;
     }
 

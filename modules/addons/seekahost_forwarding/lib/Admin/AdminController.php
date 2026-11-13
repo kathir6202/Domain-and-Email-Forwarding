@@ -19,7 +19,8 @@ class AdminController
     const PER_PAGE = 50;
     const STATUSES = ['pending', 'active', 'error', 'suspended', 'disabled', 'migrating'];
     const MIGRATION_STATES = [
-        'discovered' => 'default', 'scanned' => 'info', 'imported' => 'primary', 'verifying' => 'info', 'migrated' => 'success',
+        'discovered' => 'default', 'scanned' => 'info', 'imported' => 'primary', 'moving' => 'warning', 'verifying' => 'info',
+        'restoring' => 'info', 'migrated' => 'success',
         'failed' => 'warning', 'rolled_back' => 'warning', 'rollback_failed' => 'danger', 'skipped' => 'default',
     ];
 
@@ -825,7 +826,7 @@ class AdminController
                 $n = Migrator::markRestored($ids);
                 $this->flash($n ? 'success' : 'error', $n
                     ? $n . ' domain(s) marked as restored. They can be moved again.'
-                    : 'Nothing marked: only "rollback failed" domains whose new setup is no longer on the server can be marked as restored.');
+                    : 'Nothing marked: only "rollback failed" or "restoring" domains whose new setup is no longer on the server can be marked as restored.');
                 break;
             case 'stop':
                 unset($_SESSION['shfwd_mig_queue']);
@@ -839,15 +840,8 @@ class AdminController
                 if (!$ids) {
                     Validator::fail('Select the imported domains to move.');
                 }
-                $migrator = Migrator::forServer($serverId);
-                // Pre-flight once per Move run, and only when parked domains need a new addon domain.
+                // Only queue the work here: every step below runs as its own short request.
                 $kinds = Capsule::table(Schema::T_MIGRATION)->whereIn('id', $ids)->where('state', '!=', 'migrated')->pluck('kind')->all();
-                if (in_array('parked', $kinds, true)) {
-                    $note = $migrator->preflight();
-                    if ($note !== '') {
-                        $this->flash('error', $note);
-                    }
-                }
                 if ($billing === 'all') {
                     Migrator::setAccessModeAll();
                 }
@@ -855,23 +849,68 @@ class AdminController
                     'server' => $serverId,
                     'ids' => $ids,
                     'opts' => ['billing' => $billing, 'accept_diff' => !empty($in['accept_diff']), 'keep_default' => !empty($in['keep_default'])],
-                    'size' => max(1, min(5, (int) (isset($in['batch']) ? $in['batch'] : 1))),
+                    'preflight' => in_array('parked', $kinds, true),
+                    'total' => count($ids),
                 ];
                 Logger::log('migration', 'Move started for ' . count($ids) . ' domain(s), billing: ' . $billing);
-                // no break: process the first batch now
+                $back['continue'] = 'move';
+                break;
             case 'move_continue':
                 $q = isset($_SESSION['shfwd_mig_queue']) ? $_SESSION['shfwd_mig_queue'] : null;
                 if (!$q) {
                     break;
                 }
-                $left = Migrator::forServer($q['server'])->moveBatch($q['ids'], $q['opts'], $q['size']);
+                $migrator = Migrator::forServer($q['server']);
+                if (!empty($q['preflight'])) {
+                    // Step 1 of the run: pre-flight test only (parked domains need a new addon domain).
+                    try {
+                        $note = $migrator->preflight();
+                    } catch (\InvalidArgumentException $e) {
+                        unset($_SESSION['shfwd_mig_queue']);
+                        throw $e;
+                    }
+                    $_SESSION['shfwd_mig_queue']['preflight'] = false;
+                    $this->flash('success', 'Pre-flight test passed.');
+                    if ($note !== '') {
+                        $this->flash('error', $note);
+                    }
+                    $back['continue'] = 'move';
+                    break;
+                }
+                // Then one domain per request.
+                $left = $migrator->moveBatch($q['ids'], $q['opts'], 1);
                 if ($left) {
                     $_SESSION['shfwd_mig_queue']['ids'] = $left;
                     $back['continue'] = 'move';
-                    $this->flash('success', 'Batch done; ' . count($left) . ' domain(s) left.');
+                    $total = isset($q['total']) ? (int) $q['total'] : count($left) + 1;
+                    $this->flash('success', ($total - count($left)) . ' of ' . $total . ' done.');
                 } else {
                     unset($_SESSION['shfwd_mig_queue']);
                     $this->flash('success', 'Move finished. Review the results below.');
+                    if (Capsule::table(Schema::T_MIGRATION)->where('server_id', $q['server'])->whereIn('state', ['verifying', 'restoring'])->exists()) {
+                        $back['continue'] = 'verify';
+                    }
+                }
+                break;
+            case 'verify_pending':
+                list($checked, $done) = Migrator::verifyPendingAll(10, $serverId);
+                if ($done) {
+                    $this->flash('success', $done . ' waiting domain(s) finished.');
+                }
+                if (Capsule::table(Schema::T_MIGRATION)->where('server_id', $serverId)->whereIn('state', ['verifying', 'restoring'])->exists()
+                    && empty($in['once'])) {
+                    $back['continue'] = 'verify';
+                }
+                break;
+            case 'resume':
+            case 'undo':
+                $migrator = Migrator::forServer($serverId);
+                foreach (Capsule::table(Schema::T_MIGRATION)->whereIn('id', $ids)->get()->all() as $rec) {
+                    list($ok, $message) = $op === 'resume' ? $migrator->resume($rec) : $migrator->undoInterrupted($rec);
+                    $this->flash($ok ? 'success' : 'error', $message);
+                }
+                if (Capsule::table(Schema::T_MIGRATION)->where('server_id', $serverId)->whereIn('state', ['verifying', 'restoring'])->exists()) {
+                    $back['continue'] = 'verify';
                 }
                 break;
         }
@@ -894,26 +933,37 @@ class AdminController
         $mig = $this->url(['action' => 'migration']);
         $token = $this->token();
 
-        // Auto-continue for long scans / moves.
+        $counts = Capsule::table(Schema::T_MIGRATION)->where('server_id', $serverId)->selectRaw('state, count(*) as n')->groupBy('state')->pluck('n', 'state');
+        $count = function ($state) use ($counts) {
+            return (int) (isset($counts[$state]) ? $counts[$state] : 0);
+        };
+
+        // Auto-continue: every step is its own short request (scan batch, pre-flight, one domain, a quick re-check).
         $continue = (string) $this->q('continue');
-        if ($continue === 'scan' || ($continue === 'move' && !empty($_SESSION['shfwd_mig_queue']))) {
+        $steps = ['scan' => ['scan', 800, 'Scanning&hellip; the next batch starts automatically.'],
+            'move' => ['move_continue', 800, 'Moving&hellip; the next domain starts automatically (one domain per step).'],
+            'verify' => ['verify_pending', 15000, 'Some domains are waiting for the web server to load the change. Checking again automatically every 15 seconds '
+                . '(the WHMCS cron also finishes them if you leave this page).']];
+        if (isset($steps[$continue]) && ($continue !== 'move' || !empty($_SESSION['shfwd_mig_queue']))) {
+            list($nextOp, $delay, $text) = $steps[$continue];
             echo '<form method="post" id="shfwd-continue" action="' . self::e($mig) . '">' . $token
-                . '<input type="hidden" name="op" value="' . ($continue === 'scan' ? 'scan' : 'move_continue') . '"><input type="hidden" name="auto" value="1">'
+                . '<input type="hidden" name="op" value="' . $nextOp . '"><input type="hidden" name="auto" value="1">'
                 . '<input type="hidden" name="server_id" value="' . $serverId . '"></form>'
-                . '<div class="alert alert-info">Working&hellip; the next batch starts automatically. '
+                . '<div class="alert alert-info">' . $text . ' '
                 . '<form method="post" class="inline" action="' . self::e($mig) . '">' . $token
                 . '<input type="hidden" name="op" value="stop"><button class="btn btn-xs btn-sm btn-default">Stop</button></form></div>'
-                . '<script>setTimeout(function(){document.getElementById("shfwd-continue").submit();}, 800);</script>';
+                . '<script>setTimeout(function(){document.getElementById("shfwd-continue").submit();}, ' . (int) $delay . ');</script>';
+        } elseif ($count('verifying') + $count('restoring') > 0) {
+            echo '<div class="alert alert-info">' . ($count('verifying') + $count('restoring')) . ' domain(s) are waiting for the web server. '
+                . '<form method="post" class="inline" action="' . self::e($mig) . '">' . $token
+                . '<input type="hidden" name="op" value="verify_pending"><input type="hidden" name="server_id" value="' . $serverId . '">'
+                . '<button class="btn btn-xs btn-sm btn-primary">Check now</button></form> (the WHMCS cron also checks them every run)</div>';
         }
 
         $options = '';
         foreach ($servers as $s) {
             $options .= '<option value="' . (int) $s->id . '"' . ($serverId === (int) $s->id ? ' selected' : '') . '>' . self::e($s->name . ' (' . $s->account . '@' . $s->hostname . ')') . '</option>';
         }
-        $counts = Capsule::table(Schema::T_MIGRATION)->where('server_id', $serverId)->selectRaw('state, count(*) as n')->groupBy('state')->pluck('n', 'state');
-        $count = function ($state) use ($counts) {
-            return (int) (isset($counts[$state]) ? $counts[$state] : 0);
-        };
 
         echo '<div class="well"><form method="post" class="form-inline" action="' . self::e($mig) . '">' . $token
             . '<strong>1. Discover</strong> &nbsp; cPanel server / account used by the old module: <select name="server_id" class="form-control">' . $options . '</select> '
@@ -971,7 +1021,9 @@ class AdminController
             echo '<tr><td><input type="checkbox" class="shfwd-mig-id" name="ids[]" value="' . (int) $r->id . '"></td>'
                 . '<td>' . self::e(Validator::toUnicode($r->domain)) . '</td><td>' . self::e($r->kind) . '</td>'
                 . '<td>' . ($r->client_id ? '<a href="clientssummary.php?userid=' . (int) $r->client_id . '">#' . (int) $r->client_id . '</a>' : '-') . '</td>'
-                . '<td><span class="label label-' . $cls . ' badge badge-' . $cls . '">' . self::e(str_replace('_', ' ', $r->state)) . '</span>' . ($r->blocking ? ' <span class="label label-danger badge badge-danger">blocked</span>' : '') . '</td>'
+                . '<td><span class="label label-' . $cls . ' badge badge-' . $cls . '">' . self::e(str_replace('_', ' ', $r->state)) . '</span>'
+                . ($r->blocking ? ' <span class="label label-danger badge badge-danger">blocked</span>' : '')
+                . (Migrator::isInterrupted($r) ? ' <span class="label label-danger badge badge-danger">interrupted</span>' : '') . '</td>'
                 . '<td>' . (isset($map['urls']) ? count($map['urls']) : '-') . '</td>'
                 . '<td>' . (isset($map['emails']) ? count($map['emails']) : '-') . '</td>'
                 . '<td>' . self::e(!empty($map['catchall']) ? $map['catchall'] : '-') . '</td>'
@@ -984,15 +1036,18 @@ class AdminController
             . '<button class="btn btn-default" name="op" value="cancel">Cancel import</button> '
             . '<button class="btn btn-default" name="op" value="rescan">Re-scan</button> '
             . '<button class="btn btn-default" name="op" value="skip">Skip</button></p>'
-            . '<p><strong>Verifying or rollback failed?</strong> <em>Verifying</em> rows finish automatically with the WHMCS cron; Re-check finishes them now. '
+            . '<p><strong>Interrupted move?</strong> (the request was cut off, e.g. by a web-server timeout) '
+            . '<button class="btn btn-success" name="op" value="resume">Resume</button> finishes it, '
+            . '<button class="btn btn-warning" name="op" value="undo" onclick="return confirm(\'Put the old setup back for the selected interrupted domains?\')">Undo</button> puts the old setup back.</p>'
+            . '<p><strong>Verifying, restoring or rollback failed?</strong> <em>Verifying</em> and <em>restoring</em> rows finish automatically (this page and the WHMCS cron); Re-check checks them now. '
             . 'For <em>rollback failed</em>, restore the domain (see its snapshot), then: '
             . '<button class="btn btn-info" name="op" value="recheck">Re-check</button> '
             . '<button class="btn btn-warning" name="op" value="mark_restored" onclick="return confirm(\'Only use this after you have confirmed the old setup works again. Mark the selected rollback-failed domains as restored?\')">Mark restored</button> '
             . '<small class="text-muted">Re-check compares the live setup with the snapshot; Mark restored is a manual override.</small></p>'
             . '<hr><p><strong>4. Move imported domains</strong> &mdash; billing for migrated domains:</p>' . $billing
-            . '<p style="margin-top:8px">Domains per batch <input type="number" name="batch" value="1" min="1" max="5" class="form-control" style="display:inline-block;width:80px"> '
-            . '<small class="text-muted">Addon domains are switched in place (no Apache rebuild). Parked domains wait up to ' . (int) Migrator::waitSeconds()
-            . ' s for cPanel to reload Apache, then continue as <em>verifying</em>. A pre-flight test runs once per Move when parked domains are included.</small></p>'
+            . '<p style="margin-top:8px"><small class="text-muted">One domain per step, each step a short request. Addon domains are switched in place (no Apache rebuild); '
+            . 'addon domains whose folder is shared or holds a website are blocked by the scan. Parked domains wait up to ' . (int) Migrator::waitSeconds()
+            . ' s for the web server, then continue as <em>verifying</em>. A pre-flight test runs first when parked domains are included.</small></p>'
             . '<p><label style="font-weight:normal"><input type="checkbox" name="keep_default" value="1" checked> Keep unrouted mail as before '
             . '(mail to unknown addresses keeps going where it goes today, e.g. the account mailbox)</label></p><p>'
             . '<label style="font-weight:normal"><input type="checkbox" name="accept_diff" value="1"> keep the new setup even if the verification shows differences (not recommended)</label></p>'

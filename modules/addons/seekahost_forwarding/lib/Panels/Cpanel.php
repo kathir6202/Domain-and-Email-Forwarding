@@ -240,7 +240,12 @@ class Cpanel extends AbstractPanel
     {
         $dir = $this->homeDir() . '/' . $ref['dir'];
         if (isset($files['.htaccess'])) {
-            $files['.htaccess'] = self::keepCpanelBlocks($files['.htaccess'], $this->readFile($dir, '.htaccess'));
+            try {
+                $existing = $this->readFile($dir, '.htaccess');
+            } catch (\Throwable $e) {
+                $existing = null; // never let this optional step block a deploy
+            }
+            $files['.htaccess'] = self::keepCpanelBlocks($files['.htaccess'], $existing);
         }
         foreach ($files as $name => $content) {
             $this->cpanel(3, 'Fileman', 'save_file_content', [

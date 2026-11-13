@@ -159,14 +159,11 @@ foreach ((array) \$rules as \$r) {
 
 header('Cache-Control: no-cache, no-store, must-revalidate');
 header('Content-Type: text/html; charset=UTF-8');
-if (\$parkedOnly) {
-    echo base64_decode('{$parking}');
-    exit;
+// No forwarder matched: show the parking page (as a parked domain would), 404 for other paths.
+if (!\$parkedOnly && \$trimmed !== '') {
+    http_response_code(404);
 }
-http_response_code(404);
-echo '<!DOCTYPE html><html><head><meta charset="utf-8"><title>Not Found</title></head>'
-    . '<body style="font-family:sans-serif;text-align:center;padding:60px"><h1>Not Found</h1>'
-    . '<p>No forwarding is configured for this address.</p></body></html>';
+echo base64_decode('{$parking}');
 
 PHP;
     }

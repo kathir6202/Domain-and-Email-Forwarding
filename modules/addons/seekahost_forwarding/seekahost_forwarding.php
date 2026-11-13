@@ -90,7 +90,7 @@ function seekahost_forwarding_config()
                 'FriendlyName' => 'Parking Page HTML',
                 'Type' => 'textarea',
                 'Rows' => '4',
-                'Description' => 'Shown for parked domains without URL forwarders. {domain} is replaced. Empty = built-in page.',
+                'Description' => 'Shown for parked domains and for addresses no forwarder matches. {domain} is replaced. Empty = built-in page.',
             ],
             'auto_ssl' => [
                 'FriendlyName' => 'Auto Request SSL (Let\'s Encrypt)',
@@ -117,11 +117,12 @@ function seekahost_forwarding_config()
                 'Description' => 'Allow token-authenticated API access (manage tokens under Addons &gt; this module &gt; API).',
             ],
             'migration_wait' => [
-                'FriendlyName' => 'Migration: Apache Wait (seconds)',
+                'FriendlyName' => 'Migration: Web Server Wait (seconds)',
                 'Type' => 'text',
                 'Size' => '5',
-                'Default' => '120',
-                'Description' => 'How long the migration wizard waits for cPanel to reload Apache before a parked domain is left in "verifying" (finished by the cron).',
+                'Default' => '10',
+                'Description' => 'How long one migration step waits for the web server (max 20, keeps requests short). '
+                    . 'Domains not live yet continue as "verifying" and are finished automatically.',
             ],
             'delete_on_deactivate' => [
                 'FriendlyName' => 'Delete Data on Deactivate',

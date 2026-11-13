@@ -55,6 +55,24 @@ class FakeCpanel extends \SeekaHost\Forwarding\Panels\Cpanel
         $st = &self::$st;
         $out = [];
         switch ($key) {
+            case 'DomainInfo::domains_data':
+                $out = ['main_domain' => ['domain' => $st['main'], 'documentroot' => self::$home . '/public_html'],
+                    'addon_domains' => [], 'sub_domains' => [], 'parked_domains' => array_keys($st['parked'])];
+                foreach ($st['addon'] as $d => $a) {
+                    $out['addon_domains'][] = ['domain' => $d, 'documentroot' => self::$home . '/' . $a['dir']];
+                    $out['sub_domains'][] = ['domain' => $a['label'] . '.' . $st['main'], 'documentroot' => self::$home . '/' . $a['dir']];
+                }
+                break;
+            case 'Fileman::list_files':
+                if (!is_dir($p['dir'])) {
+                    throw new RuntimeException('The directory “' . $p['dir'] . '” does not exist.');
+                }
+                foreach (scandir($p['dir']) as $f) {
+                    if ($f !== '.' && $f !== '..') {
+                        $out[] = ['file' => $f, 'fullpath' => $p['dir'] . '/' . $f, 'type' => is_dir($p['dir'] . '/' . $f) ? 'dir' : 'file'];
+                    }
+                }
+                break;
             case 'DomainInfo::list_domains':
                 $out = ['main_domain' => $st['main'], 'parked_domains' => array_keys($st['parked']), 'addon_domains' => array_keys($st['addon'])];
                 break;
@@ -145,6 +163,12 @@ class FakeCpanel extends \SeekaHost\Forwarding\Panels\Cpanel
             case 'Fileman::fileop':
                 if ($p['op'] === 'unlink' && is_file($p['sourcefiles'])) {
                     unlink($p['sourcefiles']);
+                } elseif ($p['op'] === 'unlink' && is_dir($p['sourcefiles'])) {
+                    $it = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($p['sourcefiles'], FilesystemIterator::SKIP_DOTS), RecursiveIteratorIterator::CHILD_FIRST);
+                    foreach ($it as $f) {
+                        $f->isDir() ? rmdir($f->getPathname()) : unlink($f->getPathname());
+                    }
+                    rmdir($p['sourcefiles']);
                 }
                 break;
             case 'Fileman::save_file_content':

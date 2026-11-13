@@ -16,14 +16,21 @@ use WHMCS\Database\Capsule;
  * (parked/addon domains with cPanel redirects and email routing) into this module,
  * on the same cPanel account, one domain at a time with live verification and rollback.
  *
+ * Every step is short: one domain per admin request, no long waits (web servers such as
+ * LiteSpeed cut long requests off). Waiting for the web server is finished by the admin page's
+ * automatic re-check or by the WHMCS cron.
+ *
  * Record states:
  *   discovered      found on the account, not scanned yet
  *   scanned         read-only scan done (mapping + issues stored)
  *   imported        rules copied into this module (domain status "migrating"); server untouched
+ *   moving          the move started (snapshot and backup stored first); "interrupted" when stuck
+ *   verifying       moved; waiting for the web server before the final verification
  *   migrated        moved and verified
  *   failed          move aborted before anything changed on the server
+ *   restoring       rolled back; waiting for the web server to serve the old setup again
  *   rolled_back     move failed and the old setup was restored and verified
- *   rollback_failed move failed and the old setup could NOT be fully restored (admin action needed)
+ *   rollback_failed the old setup could NOT be fully restored (admin action needed)
  *   skipped         ignored by the admin
  */
 class Migrator
@@ -37,7 +44,7 @@ class Migrator
     ];
 
     private $server;
-    /** Seconds to wait for cPanel to rebuild and reload Apache (null = module setting, default 120). */
+    /** Seconds one request waits for the web server (null = module setting, default 10, max 20). */
     public static $wait;
     /** Seconds between checks while waiting. */
     public static $interval = 5;
@@ -168,6 +175,12 @@ class Migrator
             return;
         }
         list($mapping, $issues, $blocking) = $this->map($d, $live);
+        if ($rec->kind === 'addon') {
+            foreach ($this->folderProblems($d, $addonRow) as $problem) {
+                $blocking = true;
+                $issues[] = 'Cannot be switched in place: ' . $problem . '.';
+            }
+        }
 
         $domainRow = Capsule::table('tbldomains')
             ->whereIn('domain', array_unique([$d, Validator::toUnicode($d)]))
@@ -479,6 +492,16 @@ class Migrator
 
     /* ------------------------------------------------------------------ move */
 
+    /** Longest time one admin request waits for the web server (keeps every request short). */
+    const QUICK_WAIT_MAX = 20;
+    /** A "moving" record older than this is treated as an interrupted request. */
+    const INTERRUPTED_AFTER = 180;
+    /** Files that may exist in a forwarding-only addon folder; anything else counts as a website. */
+    const HARMLESS_FILES = ['.htaccess', 'cgi-bin', '.well-known', 'php.ini', '.user.ini', 'error_log', '.ftpquota'];
+
+    /** @var string|null test hook: stop after a step to simulate an interrupted request ("detach", "provision") */
+    public static $haltAfter;
+
     public static function setAccessModeAll()
     {
         $q = Capsule::table('tbladdonmodules')->where('module', SEEKAHOST_FWD_MODULE)->where('setting', 'access_mode');
@@ -492,10 +515,11 @@ class Migrator
     }
 
     /**
-     * @param array $opts billing (flag|flag_charge|all|none), accept_diff (bool)
+     * Move the next domain(s); the admin page calls this once per short request.
+     * @param array $opts billing (flag|flag_charge|all|none), accept_diff (bool), keep_default (bool)
      * @return array remaining ids
      */
-    public function moveBatch(array $ids, array $opts, $limit = 5)
+    public function moveBatch(array $ids, array $opts, $limit = 1)
     {
         $batch = array_slice($ids, 0, $limit);
         foreach ($batch as $id) {
@@ -504,7 +528,12 @@ class Migrator
                 try {
                     $this->move($rec, $opts);
                 } catch (\Throwable $e) {
-                    self::save($rec, ['state' => 'failed', 'message' => 'Unexpected error: ' . $e->getMessage()]);
+                    $rec = self::reload($rec);
+                    if ($rec->state === 'moving') {
+                        self::save($rec, ['message' => 'Interrupted by an unexpected error: ' . $e->getMessage() . ' Use Resume or Undo.']);
+                    } else {
+                        self::save($rec, ['state' => 'failed', 'message' => 'Unexpected error: ' . $e->getMessage()]);
+                    }
                 }
             }
         }
@@ -530,10 +559,15 @@ class Migrator
         return md5(json_encode([$redirects, $fw, $live['domain_forwarder'], $live['default_address']]));
     }
 
-    private static function fail($rec, $message)
+    private static function fail($rec, $message, $state = 'failed')
     {
-        self::save($rec, ['state' => 'failed', 'message' => $message]);
+        self::save($rec, ['state' => $state, 'message' => $message]);
         Logger::log('migration', $rec->domain . ': ' . $message, 'warning', $rec->client_id, $rec->domain_id);
+    }
+
+    private static function fwdOf($rec)
+    {
+        return $rec->domain_id ? Capsule::table(Schema::T_DOMAINS)->where('domain_id', $rec->domain_id)->first() : null;
     }
 
     public function move($rec, array $opts)
@@ -542,7 +576,7 @@ class Migrator
             return;
         }
         $d = $rec->domain;
-        $fwd = $rec->domain_id ? Capsule::table(Schema::T_DOMAINS)->where('domain_id', $rec->domain_id)->first() : null;
+        $fwd = self::fwdOf($rec);
         if (!$fwd || $fwd->status !== 'migrating') {
             self::fail($rec, 'Not imported (or changed since import). Cancel and import again.');
             return;
@@ -589,76 +623,111 @@ class Migrator
             'keep_default' => $keep,
             'started_at' => date('Y-m-d H:i:s'),
         ];
-        Capsule::table(Schema::T_DOMAINS)->where('id', $fwd->id)->update(['keep_default' => $keep]);
 
         if ($rec->kind === 'addon') {
-            $this->moveInPlace($rec, $fwd, $live, $map, $result, $opts);
-        } else {
-            $this->moveParked($rec, $fwd, $live, $map, $result, $opts);
+            // In place only for a forwarding-only folder that no other domain uses.
+            $problems = $this->folderProblems($d, $addonRow);
+            if ($problems) {
+                self::fail($rec, 'Not moved in place: ' . implode('; ', $problems) . '. Nothing was changed.');
+                return;
+            }
+            $dir = self::addonDir($addonRow);
+            try {
+                $result['backup'] = [
+                    'dir' => $dir,
+                    'htaccess' => $this->legacy->readFile($dir, '.htaccess'),
+                    'index_php' => $this->legacy->readFile($dir, 'index.php'),
+                ];
+            } catch (\Throwable $e) {
+                self::fail($rec, 'Could not back up the current files: ' . $e->getMessage() . ' Nothing was changed.');
+                return;
+            }
+            $result['in_place'] = true;
         }
+
+        // Record the move before anything changes, so an interrupted request can be resumed or undone.
+        self::save($rec, ['state' => 'moving', 'result' => $result, 'message' => 'Moving (started ' . $result['started_at'] . ').']);
+        Capsule::table(Schema::T_DOMAINS)->where('id', $fwd->id)->update(['keep_default' => $keep]);
+        $rec = self::reload($rec);
+
+        if ($rec->kind === 'parked') {
+            try {
+                $this->legacy->detach($d, 'parked', null);
+            } catch (\Throwable $e) {
+                Capsule::table(Schema::T_DOMAINS)->where('id', $fwd->id)->update(['keep_default' => null]);
+                self::fail($rec, 'Could not remove the old setup: ' . $e->getMessage() . ' Nothing was changed.');
+                return;
+            }
+            if (self::$haltAfter === 'detach') {
+                return;
+            }
+        }
+        try {
+            Capsule::table(Schema::T_DOMAINS)->where('id', $fwd->id)->update(['status' => 'pending', 'server_id' => $this->server->id, 'remote_ref' => null]);
+            Service::provision(Service::reload($fwd)); // addon domains: adopts the existing domain and folder
+        } catch (\Throwable $e) {
+            $this->undoMove($rec, $fwd, $live, $result, $e->getMessage());
+            return;
+        }
+        if (self::$haltAfter === 'provision') {
+            return;
+        }
+        $this->settle($rec, $fwd, $live, $map, $result, $opts);
+    }
+
+    private static function addonDir($addonRow)
+    {
+        return trim(preg_replace('#^home:/?#', '', (string) CpanelLegacy::field((array) $addonRow, ['reldir', 'basedir'])), '/');
     }
 
     /**
-     * Addon domains stay on the account: only their forwarding files change, so Apache is not
-     * rebuilt, the switch is instant and a rollback just puts the saved files back.
+     * Reasons an addon domain must not be switched in place: its folder is the main website folder,
+     * is shared with other domains, or holds website files.
+     * @return string[]
      */
-    private function moveInPlace($rec, $fwd, array $live, array $map, array $result, array $opts)
+    public function folderProblems($d, $addonRow)
     {
-        $d = $rec->domain;
-        $dir = preg_replace('#^home:/?#', '', (string) CpanelLegacy::field((array) $live['addon'], ['reldir', 'basedir']));
+        $dir = self::addonDir($addonRow);
         if ($dir === '') {
-            self::fail($rec, 'Could not determine the document root of the addon domain. Nothing was changed.');
-            return;
+            return ['its document root could not be determined'];
         }
-        try {
-            $result['backup'] = [
-                'dir' => $dir,
-                'htaccess' => $this->legacy->readFile($dir, '.htaccess'),
-                'index_php' => $this->legacy->readFile($dir, 'index.php'),
-            ];
-        } catch (\Throwable $e) {
-            self::fail($rec, 'Could not back up the current files: ' . $e->getMessage() . ' Nothing was changed.');
-            return;
+        if ($dir === 'public_html' || $dir === 'www') {
+            return ['its document root is the main website folder (public_html)'];
         }
-        $result['in_place'] = true;
-
+        $problems = [];
         try {
-            Capsule::table(Schema::T_DOMAINS)->where('id', $fwd->id)->update(['status' => 'pending', 'server_id' => $this->server->id, 'remote_ref' => null]);
-            Service::provision(Service::reload($fwd)); // adopts the existing addon domain and folder
-            list($after, $waited, $isLive) = $this->awaitNew($d, $live);
-            $result['waited_seconds'] = $waited;
-            $result['after'] = $after;
-            $diffs = self::compare($live['probes'], $after);
-            if (!$isLive) {
-                $diffs[] = 'The new forwarding files were not answering after ' . $waited . ' seconds';
+            $ownSub = strtolower(CpanelLegacy::originalLabel((array) $addonRow) . '.' . CpanelLegacy::field((array) $addonRow, ['rootdomain']));
+            $map = $this->legacy->docrootMap();
+            $abs = $this->legacy->absPath($dir);
+            $others = [];
+            foreach (isset($map[$abs]) ? $map[$abs] : [] as $other) {
+                if ($other !== $d && $other !== 'www.' . $d && $other !== $ownSub) {
+                    $others[] = $other;
+                }
             }
-            $diffs = array_merge($diffs, $this->verifyEmail($d, $map, $result['keep_default']));
-            $result['diffs'] = $diffs;
-            if ($diffs && empty($opts['accept_diff'])) {
-                throw new \RuntimeException('Verification failed: ' . implode('; ', array_slice($diffs, 0, 5)));
+            if ($others) {
+                $problems[] = 'its folder (' . $dir . ') is shared with ' . implode(', ', array_slice($others, 0, 5)) . (count($others) > 5 ? ' and more' : '');
             }
         } catch (\Throwable $e) {
-            $this->rollbackInPlace($rec, $fwd, $live, $result, $e->getMessage());
-            return;
+            $problems[] = 'could not check whether its folder is shared (' . $e->getMessage() . ')';
         }
-        $this->finalize($rec, $live, $result, $opts);
+        try {
+            $extra = array_values(array_diff($this->legacy->listFolder($dir), self::HARMLESS_FILES));
+            if ($extra) {
+                $problems[] = 'its folder (' . $dir . ') contains website files (' . implode(', ', array_slice($extra, 0, 5)) . (count($extra) > 5 ? ', ...' : '') . ')';
+            }
+        } catch (\Throwable $e) {
+            $problems[] = 'could not list its folder (' . $e->getMessage() . ')';
+        }
+        return $problems;
     }
 
-    /** Parked domains must be unparked and added as addon domains, which needs an Apache rebuild. */
-    private function moveParked($rec, $fwd, array $live, array $map, array $result, array $opts)
+    /** After provisioning: verify email now and the web within a short wait; otherwise continue as "verifying". */
+    private function settle($rec, $fwd, array $live, array $map, array $result, array $opts)
     {
         $d = $rec->domain;
+        $result['provisioned_at'] = date('Y-m-d H:i:s');
         try {
-            $this->legacy->detach($d, 'parked', null);
-        } catch (\Throwable $e) {
-            self::fail($rec, 'Could not remove the old setup: ' . $e->getMessage() . ' Nothing was changed.');
-            return;
-        }
-        try {
-            Capsule::table(Schema::T_DOMAINS)->where('id', $fwd->id)->update(['status' => 'pending', 'server_id' => $this->server->id, 'remote_ref' => null]);
-            Service::provision(Service::reload($fwd));
-            $result['provisioned_at'] = date('Y-m-d H:i:s');
-            // Email routing does not depend on Apache: check it right away.
             $mailDiffs = $this->verifyEmail($d, $map, $result['keep_default']);
             if ($mailDiffs && empty($opts['accept_diff'])) {
                 throw new \RuntimeException('Verification failed: ' . implode('; ', array_slice($mailDiffs, 0, 5)));
@@ -667,14 +736,13 @@ class Migrator
             $result['waited_seconds'] = $waited;
             $result['after'] = $after;
             if (!$isLive) {
-                // Apache has not loaded the change yet: keep the new setup and finish verification later.
                 self::save($rec, [
                     'state' => 'verifying',
                     'result' => $result,
-                    'message' => 'Waiting for cPanel to reload Apache (not live after ' . $waited . ' s). '
-                        . 'Verification finishes automatically with the WHMCS cron, or click Re-check.',
+                    'message' => 'Moved; waiting for the web server to load the change (not live after ' . $waited . ' s). '
+                        . 'Verification finishes automatically on this page, with the WHMCS cron, or with Re-check.',
                 ]);
-                Logger::log('migration', $d . ' moved; waiting for Apache before verifying', 'info', $rec->client_id, $rec->domain_id);
+                Logger::log('migration', $d . ' moved; waiting for the web server before verifying', 'info', $rec->client_id, $rec->domain_id);
                 return;
             }
             $diffs = array_merge(self::compare($live['probes'], $after), $mailDiffs);
@@ -683,10 +751,19 @@ class Migrator
                 throw new \RuntimeException('Verification failed: ' . implode('; ', array_slice($diffs, 0, 5)));
             }
         } catch (\Throwable $e) {
-            $this->rollback($rec, $fwd, $live, $result, $e->getMessage());
+            $this->undoMove($rec, $fwd, $live, $result, $e->getMessage());
             return;
         }
         $this->finalize($rec, $live, $result, $opts);
+    }
+
+    private function undoMove($rec, $fwd, array $live, array $result, $reason)
+    {
+        if (!empty($result['in_place'])) {
+            $this->rollbackInPlace($rec, $fwd, $live, $result, $reason);
+        } else {
+            $this->rollback($rec, $fwd, $live, $result, $reason);
+        }
     }
 
     /** Success: clean up inactive legacy redirect entries and apply the billing choice. */
@@ -746,60 +823,118 @@ class Migrator
         } catch (\Throwable $e) {
             $steps[] = 'Restoring email routing failed: ' . $e->getMessage();
         }
-        $this->finishRollback($rec, $live, $result, $reason, $steps, true);
+        $this->finishRollback($rec, $live, $result, $reason, $steps);
     }
 
-    private function finishRollback($rec, array $live, array $result, $reason, array $steps, $waitForOld)
+    /** Parked domain: remove the new addon domain, park the domain again and restore its mail routing. */
+    private function rollback($rec, $fwd, array $live, array $result, $reason)
     {
-        list($back, $waited) = $waitForOld
-            ? $this->awaitOld($rec->domain, $live)
-            : [$this->probeAll($rec->domain, self::probePaths($live['redirects'])), 0];
+        $steps = [];
+        try {
+            Service::unprovision(Service::reload($fwd), 'migrating', 'migration rollback');
+        } catch (\Throwable $e) {
+            $steps[] = 'Removing the new setup failed: ' . $e->getMessage();
+        }
+        Capsule::table(Schema::T_DOMAINS)->where('id', $fwd->id)->update(['status' => 'migrating', 'remote_ref' => null, 'keep_default' => null]);
+        try {
+            $this->legacy->reattach($rec->domain, $rec->kind, isset($live['addon']) ? $live['addon'] : null);
+        } catch (\Throwable $e) {
+            if (!preg_match('/already|exists/i', $e->getMessage())) {
+                $steps[] = 'Re-adding the old domain failed: ' . $e->getMessage();
+            }
+        }
+        try {
+            $this->legacy->restoreEmail($rec->domain, $live);
+        } catch (\Throwable $e) {
+            $steps[] = 'Restoring email routing failed: ' . $e->getMessage();
+        }
+        $this->finishRollback($rec, $live, $result, $reason, $steps);
+    }
+
+    /** Check the restored setup briefly; if the web server has not loaded it yet, continue as "restoring". */
+    private function finishRollback($rec, array $live, array $result, $reason, array $steps)
+    {
+        list($back, $waited) = $steps ? [$this->probeAll($rec->domain, self::probePaths($live['redirects'])), 0] : $this->awaitOld($rec->domain, $live);
         $diffs = self::compare($live['probes'], $back);
+        $result['rollback_reason'] = $reason;
+        $result['rollback_started_at'] = date('Y-m-d H:i:s');
         $result['rollback_waited_seconds'] = $waited;
         $result['rollback'] = $back;
         $result['rollback_steps'] = $steps;
         $result['rollback_diffs'] = $diffs;
-        $ok = !$steps && !$diffs;
-        $message = 'Migration failed (' . $reason . '). '
-            . ($ok ? 'The old setup was restored and verified; nothing else changed.'
-                : 'ROLLBACK INCOMPLETE: ' . implode('; ', array_merge($steps, $diffs)) . ' Restore it manually using the snapshot below, then click Re-check.');
-        self::save($rec, ['state' => $ok ? 'rolled_back' : 'rollback_failed', 'result' => $result, 'message' => $message]);
-        if ($ok) {
-            Logger::log('migration', $rec->domain . ': ' . $message, 'warning', $rec->client_id, $rec->domain_id);
-        } else {
+        if ($steps) {
+            $message = 'Migration failed (' . $reason . '). ROLLBACK INCOMPLETE: ' . implode('; ', array_merge($steps, $diffs))
+                . ' Restore it manually using the snapshot below, then click Re-check.';
+            self::save($rec, ['state' => 'rollback_failed', 'result' => $result, 'message' => $message]);
             Logger::error('migration', $rec->domain . ': ' . $message, $rec->client_id, $rec->domain_id);
+            return;
         }
+        if ($diffs || self::anyServedByModule($back)) {
+            self::save($rec, [
+                'state' => 'restoring',
+                'result' => $result,
+                'message' => 'Migration failed (' . $reason . '). The old setup was put back; waiting for the web server to load it. '
+                    . 'This finishes automatically on this page, with the WHMCS cron, or with Re-check.',
+            ]);
+            Logger::log('migration', $rec->domain . ': rolled back, waiting for the web server', 'warning', $rec->client_id, $rec->domain_id);
+            return;
+        }
+        $message = 'Migration failed (' . $reason . '). The old setup was restored and verified; nothing else changed.';
+        self::save($rec, ['state' => 'rolled_back', 'result' => $result, 'message' => $message]);
+        Logger::log('migration', $rec->domain . ': ' . $message, 'warning', $rec->client_id, $rec->domain_id);
     }
 
     /**
-     * Finish a parked-domain move that was waiting for Apache.
+     * Finish a move ("verifying") or a rollback ("restoring") that was waiting for the web server.
+     * Never waits: one quick check per call.
      * @return array [bool done, string message]
      */
     public function verifyPending($rec)
     {
-        if ($rec->state !== 'verifying') {
-            return [false, $rec->domain . ': not waiting for verification.'];
+        if (!in_array($rec->state, ['verifying', 'restoring'], true)) {
+            return [false, $rec->domain . ': not waiting for the web server.'];
         }
         $result = self::decode($rec, 'result');
         $map = self::decode($rec, 'mapping');
         $live = isset($result['live']) ? $result['live'] : [];
         $opts = isset($result['opts']) ? $result['opts'] : [];
-        $fwd = $rec->domain_id ? Capsule::table(Schema::T_DOMAINS)->where('domain_id', $rec->domain_id)->first() : null;
+        $fwd = self::fwdOf($rec);
         if (!$fwd || !$live) {
             self::save($rec, ['state' => 'rollback_failed', 'message' => 'Verification data is missing; check the domain by hand, then use Re-check or Mark restored.']);
             return [false, $rec->domain . ': verification data missing.'];
         }
         $probes = $this->probeAll($rec->domain, self::probePaths($live['redirects']));
+        $sinceKey = $rec->state === 'verifying' ? 'provisioned_at' : 'rollback_started_at';
+        $since = isset($result[$sinceKey]) ? strtotime($result[$sinceKey]) : time();
+        $minutes = (int) floor((time() - $since) / 60);
+
+        if ($rec->state === 'restoring') {
+            if (!self::compare($live['probes'], $probes) && !self::anyServedByModule($probes)) {
+                $result['rollback'] = $probes;
+                $reason = isset($result['rollback_reason']) ? $result['rollback_reason'] : 'see verification';
+                self::save($rec, ['state' => 'rolled_back', 'result' => $result,
+                    'message' => 'Migration failed (' . $reason . '). The old setup was restored and verified; nothing else changed.']);
+                return [true, $rec->domain . ': old setup restored and verified.'];
+            }
+            if ($minutes >= 30) {
+                self::save($rec, ['state' => 'rollback_failed', 'result' => $result,
+                    'message' => 'The old setup was put back but the web server still does not serve it after ' . $minutes
+                        . ' minutes. Check the domain by hand (snapshot below), then use Re-check or Mark restored.']);
+                Logger::error('migration', $rec->domain . ': old setup not live ' . $minutes . ' minutes after rollback', $rec->client_id, $rec->domain_id);
+                return [false, $rec->domain . ': rollback not live after ' . $minutes . ' minutes.'];
+            }
+            self::save($rec, ['message' => 'Rolled back; still waiting for the web server (' . $minutes . ' min). Checked ' . date('H:i') . '.']);
+            return [false, $rec->domain . ': waiting for the web server.'];
+        }
+
         if (!self::servedByModule($probes)) {
-            $since = isset($result['provisioned_at']) ? strtotime($result['provisioned_at']) : time();
-            $minutes = (int) floor((time() - $since) / 60);
             if ($minutes >= 30 && empty($result['alerted'])) {
                 $result['alerted'] = true;
-                Logger::error('migration', $rec->domain . ': Apache has still not loaded the change after ' . $minutes
+                Logger::error('migration', $rec->domain . ': the web server has still not loaded the change after ' . $minutes
                     . ' minutes. Check WHM (rebuildhttpdconf / restartsrv_httpd).', $rec->client_id, $rec->domain_id);
             }
-            self::save($rec, ['result' => $result, 'message' => 'Still waiting for cPanel to reload Apache (' . $minutes . ' min). Checked ' . date('H:i') . '.']);
-            return [false, $rec->domain . ': Apache has not loaded the change yet.'];
+            self::save($rec, ['result' => $result, 'message' => 'Still waiting for the web server to load the change (' . $minutes . ' min). Checked ' . date('H:i') . '.']);
+            return [false, $rec->domain . ': waiting for the web server.'];
         }
         $diffs = array_merge(
             self::compare($live['probes'], $probes),
@@ -808,7 +943,7 @@ class Migrator
         $result['after'] = $probes;
         $result['diffs'] = $diffs;
         if ($diffs && empty($opts['accept_diff'])) {
-            $this->rollback($rec, $fwd, $live, $result, 'Verification failed: ' . implode('; ', array_slice($diffs, 0, 5)));
+            $this->undoMove($rec, $fwd, $live, $result, 'Verification failed: ' . implode('; ', array_slice($diffs, 0, 5)));
             $rec = self::reload($rec);
             return [false, $rec->domain . ': ' . $rec->message];
         }
@@ -816,37 +951,127 @@ class Migrator
         return [true, $rec->domain . ': migrated and verified.'];
     }
 
-    /** Called from the WHMCS cron: finish waiting moves without holding any request open. */
-    public static function verifyPendingAll($limit = 25)
+    /** One quick check for every waiting domain (WHMCS cron or the admin page); never waits. */
+    public static function verifyPendingAll($limit = 25, $serverId = null)
     {
-        $rows = Capsule::table(Schema::T_MIGRATION)->where('state', 'verifying')->orderBy('updated_at')->limit($limit)->get()->all();
+        $q = Capsule::table(Schema::T_MIGRATION)->whereIn('state', ['verifying', 'restoring']);
+        if ($serverId) {
+            $q->where('server_id', (int) $serverId);
+        }
+        $rows = $q->orderBy('updated_at')->limit($limit)->get()->all();
         $byServer = [];
         foreach ($rows as $rec) {
             $byServer[$rec->server_id][] = $rec;
         }
-        foreach ($byServer as $serverId => $recs) {
+        $done = 0;
+        foreach ($byServer as $sid => $recs) {
             try {
-                $m = self::forServer($serverId);
+                $m = self::forServer($sid);
             } catch (\Throwable $e) {
                 continue;
             }
             foreach ($recs as $rec) {
                 try {
-                    $m->verifyPending($rec);
+                    list($ok) = $m->verifyPending($rec);
+                    $done += $ok ? 1 : 0;
                 } catch (\Throwable $e) {
                     Logger::log('migration', $rec->domain . ': verification error: ' . $e->getMessage(), 'error', $rec->client_id, $rec->domain_id);
                 }
             }
         }
+        return [count($rows), $done];
     }
 
+    /* ------------------------------------------------------ interrupted moves */
+
+    /** A move whose request was cut off (e.g. by a web-server timeout) before it could finish. */
+    public static function isInterrupted($rec)
+    {
+        if ($rec->state === 'moving') {
+            return time() - strtotime((string) $rec->updated_at) >= self::INTERRUPTED_AFTER;
+        }
+        if ($rec->state === 'imported') {
+            // Interrupted by an older version that did not record the "moving" step.
+            $fwd = self::fwdOf($rec);
+            return $fwd && $fwd->status !== 'migrating';
+        }
+        return false;
+    }
+
+    /** Finish an interrupted move: (re)create the new setup and verify it. */
+    public function resume($rec)
+    {
+        if (!self::isInterrupted($rec)) {
+            return [false, $rec->domain . ': not an interrupted move.'];
+        }
+        $d = $rec->domain;
+        $result = self::decode($rec, 'result');
+        $live = !empty($result['live']) ? $result['live'] : self::decode($rec, 'snapshot');
+        $map = self::decode($rec, 'mapping');
+        $opts = isset($result['opts']) ? $result['opts'] : ['billing' => 'none'];
+        $result += ['before' => isset($live['probes']) ? $live['probes'] : [], 'live' => $live, 'opts' => $opts,
+            'keep_default' => null, 'started_at' => date('Y-m-d H:i:s')];
+        $fwd = self::fwdOf($rec);
+        if (!$fwd || !$live) {
+            return [false, $d . ': no record of the move; check the domain by hand.'];
+        }
+        $inv = $this->legacy->inventory();
+        if ($rec->kind === 'parked' && in_array($d, $inv['parked'], true)) {
+            Capsule::table(Schema::T_DOMAINS)->where('id', $fwd->id)->update(['status' => 'migrating', 'remote_ref' => null, 'keep_default' => null]);
+            self::save($rec, ['state' => 'imported', 'message' => 'The interrupted move had not changed anything (the domain is still parked). You can Move it again.']);
+            return [true, $d . ': nothing had changed yet; it can be moved again.'];
+        }
+        self::save($rec, ['state' => 'moving', 'result' => $result, 'message' => 'Resuming the interrupted move.']);
+        $rec = self::reload($rec);
+        try {
+            Capsule::table(Schema::T_DOMAINS)->where('id', $fwd->id)->update(['status' => 'pending', 'server_id' => $this->server->id]);
+            Service::provision(Service::reload($fwd));
+        } catch (\Throwable $e) {
+            $this->undoMove($rec, $fwd, $live, $result, $e->getMessage());
+            $rec = self::reload($rec);
+            return [false, $d . ': ' . $rec->message];
+        }
+        $this->settle($rec, $fwd, $live, $map, $result, $opts);
+        $rec = self::reload($rec);
+        return [in_array($rec->state, ['migrated', 'verifying'], true), $d . ': ' . $rec->message];
+    }
+
+    /** Undo an interrupted move: put the old setup back. */
+    public function undoInterrupted($rec)
+    {
+        if (!self::isInterrupted($rec)) {
+            return [false, $rec->domain . ': not an interrupted move.'];
+        }
+        $result = self::decode($rec, 'result');
+        $live = !empty($result['live']) ? $result['live'] : self::decode($rec, 'snapshot');
+        $fwd = self::fwdOf($rec);
+        if (!$fwd || !$live) {
+            return [false, $rec->domain . ': no record of the move; check the domain by hand.'];
+        }
+        if ($rec->kind === 'addon' && empty($result['backup'])) {
+            return [false, $rec->domain . ': no backup of its original files was taken (interrupted by an older version); restore it by hand from the snapshot.'];
+        }
+        $result += ['live' => $live];
+        if ($rec->kind === 'parked' && in_array($rec->domain, $this->legacy->inventory()['parked'], true)) {
+            Capsule::table(Schema::T_DOMAINS)->where('id', $fwd->id)->update(['status' => 'migrating', 'remote_ref' => null, 'keep_default' => null]);
+            self::save($rec, ['state' => 'imported', 'message' => 'Nothing had changed (the domain is still parked). You can Move it again or Cancel import.']);
+            return [true, $rec->domain . ': nothing had changed.'];
+        }
+        $this->undoMove($rec, $fwd, $live, $result, 'undo requested after an interrupted move');
+        $rec = self::reload($rec);
+        return [in_array($rec->state, ['rolled_back', 'restoring'], true), $rec->domain . ': ' . $rec->message];
+    }
+
+    /* ---------------------------------------------------------------- waiting */
+
+    /** Seconds one request may wait for the web server (setting "Migration: Apache Wait", default 10, max 20). */
     public static function waitSeconds()
     {
         if (self::$wait !== null) {
             return (int) self::$wait;
         }
         $s = Settings::int('migration_wait');
-        return $s > 0 ? $s : 120;
+        return max(1, min(self::QUICK_WAIT_MAX, $s > 0 ? $s : 10));
     }
 
     private static function pause()
@@ -856,7 +1081,7 @@ class Migrator
         }
     }
 
-    /** Every answered probe came from this module's script (i.e. the new Apache config is live). */
+    /** Every answered probe came from this module's script (i.e. the new configuration is live). */
     private static function servedByModule(array $probes)
     {
         $answered = 0;
@@ -881,10 +1106,7 @@ class Migrator
         return false;
     }
 
-    /**
-     * Wait until the new setup answers (cPanel rebuilds Apache asynchronously).
-     * @return array [probes, seconds waited, bool new setup live]
-     */
+    /** @return array [probes, seconds waited, bool new setup live] */
     private function awaitNew($d, array $live)
     {
         $paths = self::probePaths($live['redirects']);
@@ -901,10 +1123,7 @@ class Migrator
         }
     }
 
-    /**
-     * Wait until the old setup answers again exactly as captured.
-     * @return array [probes, seconds waited]
-     */
+    /** @return array [probes, seconds waited] */
     private function awaitOld($d, array $live)
     {
         $paths = self::probePaths($live['redirects']);
@@ -922,8 +1141,9 @@ class Migrator
     }
 
     /**
-     * Prove cPanel will accept an addon domain on this account before any domain is touched:
+     * Prove cPanel will accept an addon domain on this account before any parked domain is touched:
      * create and remove a throwaway addon domain (catches FTP / addon / subdomain limits).
+     * Also removes folders left behind by earlier pre-flight tests.
      * Throws when cPanel refuses for a limit reason; returns a note for other refusals.
      */
     public function preflight()
@@ -949,25 +1169,44 @@ class Migrator
         if (!empty($ref['sub'])) {
             $this->legacy->deleteFtpAccount($ref['sub']);
         }
+        $this->cleanupPreflightFolders();
         return $note;
     }
 
+    /** Best effort: delete leftover pre-flight test folders (cPanel keeps a removed addon domain's folder). */
+    private function cleanupPreflightFolders()
+    {
+        try {
+            $addons = array_keys($this->legacy->inventory()['addon']);
+            foreach ($this->legacy->listFolder(Cpanel::DOCROOT_BASE) as $entry) {
+                if (strpos($entry, 'shfwd-preflight-') === 0 && !in_array($entry, $addons, true)) {
+                    $this->legacy->deletePath(Cpanel::DOCROOT_BASE . '/' . $entry);
+                }
+            }
+        } catch (\Throwable $e) {
+            // Cosmetic only.
+        }
+    }
+
     /**
-     * Check that the old setup is back and matches the snapshot (after a rollback that could not be verified).
+     * Check a failed, rolled-back or waiting domain again.
      * @return array [bool ok, string message]
      */
     public function recheck($rec)
     {
-        if ($rec->state === 'verifying') {
+        if (in_array($rec->state, ['verifying', 'restoring'], true)) {
             return $this->verifyPending($rec);
         }
+        if (self::isInterrupted($rec)) {
+            return [false, $rec->domain . ': this move was interrupted; use Resume (finish it) or Undo (put the old setup back).'];
+        }
         if (!in_array($rec->state, ['rollback_failed', 'rolled_back', 'failed'], true)) {
-            return [false, $rec->domain . ': only failed or rolled-back domains can be re-checked.'];
+            return [false, $rec->domain . ': only failed, rolled-back or waiting domains can be re-checked.'];
         }
         $snap = self::decode($rec, 'snapshot');
         $d = $rec->domain;
         $problems = [];
-        $fwd = $rec->domain_id ? Capsule::table(Schema::T_DOMAINS)->where('domain_id', $rec->domain_id)->first() : null;
+        $fwd = self::fwdOf($rec);
         if ($fwd && Service::isPlaced($fwd)) {
             $problems[] = 'the new module setup is still registered for this domain';
         }
@@ -991,6 +1230,9 @@ class Migrator
                 foreach (self::compare($snap['probes'], $live['probes']) as $diff) {
                     $problems[] = $diff;
                 }
+                if (self::anyServedByModule($live['probes'])) {
+                    $problems[] = 'the module\'s forwarding files still answer for this domain';
+                }
             } catch (\Throwable $e) {
                 $problems[] = 'could not read the current setup: ' . $e->getMessage();
             }
@@ -1001,7 +1243,7 @@ class Migrator
             return [false, $d . ': ' . $message];
         }
         if ($fwd) {
-            Capsule::table(Schema::T_DOMAINS)->where('id', $fwd->id)->update(['status' => 'migrating', 'remote_ref' => null]);
+            Capsule::table(Schema::T_DOMAINS)->where('id', $fwd->id)->update(['status' => 'migrating', 'remote_ref' => null, 'keep_default' => null]);
         }
         $message = 'Re-check ' . date('Y-m-d H:i') . ': the old setup is live and matches the snapshot. You can move it again.';
         self::save($rec, ['state' => 'rolled_back', 'message' => $message]);
@@ -1009,17 +1251,17 @@ class Migrator
         return [true, $d . ': ' . $message];
     }
 
-    /** Admin confirms a rollback-failed domain was restored by hand. */
+    /** Admin confirms a rollback-failed (or still restoring) domain was restored by hand. */
     public static function markRestored(array $ids)
     {
         $n = 0;
-        foreach (Capsule::table(Schema::T_MIGRATION)->whereIn('id', $ids)->where('state', 'rollback_failed')->get()->all() as $rec) {
-            $fwd = $rec->domain_id ? Capsule::table(Schema::T_DOMAINS)->where('domain_id', $rec->domain_id)->first() : null;
+        foreach (Capsule::table(Schema::T_MIGRATION)->whereIn('id', $ids)->whereIn('state', ['rollback_failed', 'restoring'])->get()->all() as $rec) {
+            $fwd = self::fwdOf($rec);
             if ($fwd && Service::isPlaced($fwd)) {
                 continue; // the new setup is still on the server: not restored
             }
             if ($fwd) {
-                Capsule::table(Schema::T_DOMAINS)->where('id', $fwd->id)->update(['status' => 'migrating', 'remote_ref' => null]);
+                Capsule::table(Schema::T_DOMAINS)->where('id', $fwd->id)->update(['status' => 'migrating', 'remote_ref' => null, 'keep_default' => null]);
             }
             self::save($rec, ['state' => 'rolled_back', 'message' => 'Marked as restored by an administrator on ' . date('Y-m-d H:i') . '.']);
             Logger::log('migration', $rec->domain . ' marked as restored by an administrator', 'warning', $rec->client_id, $rec->domain_id);
@@ -1083,33 +1325,6 @@ class Migrator
             }
         }
         return $diffs;
-    }
-
-    private function rollback($rec, $fwd, array $live, array $result, $reason)
-    {
-        $steps = [];
-        try {
-            Service::unprovision(Service::reload($fwd), 'migrating', 'migration rollback');
-        } catch (\Throwable $e) {
-            $steps[] = 'Removing the new setup failed: ' . $e->getMessage();
-        }
-        Capsule::table(Schema::T_DOMAINS)->where('id', $fwd->id)->update(['status' => 'migrating', 'remote_ref' => null]);
-        $reattached = true;
-        try {
-            $this->legacy->reattach($rec->domain, $rec->kind, isset($live['addon']) ? $live['addon'] : null);
-        } catch (\Throwable $e) {
-            if (!preg_match('/already|exists/i', $e->getMessage())) {
-                $reattached = false;
-                $steps[] = 'Re-adding the old domain failed: ' . $e->getMessage();
-            }
-        }
-        try {
-            $this->legacy->restoreEmail($rec->domain, $live);
-        } catch (\Throwable $e) {
-            $steps[] = 'Restoring email routing failed: ' . $e->getMessage();
-        }
-        Capsule::table(Schema::T_DOMAINS)->where('id', $fwd->id)->update(['keep_default' => null]);
-        $this->finishRollback($rec, $live, $result, $reason, $steps, $reattached);
     }
 
     private function applyBilling($rec, $billing, array &$warnings)

@@ -31,7 +31,7 @@ class Settings
         'auto_forwarders' => 'on',
         'parking_html' => '',
         'api_enabled' => '',
-        'migration_wait' => '120',
+        'migration_wait' => '10',
     ];
 
     public static function all()

@@ -248,7 +248,7 @@ foreach (['ip.com', 'ipx.com'] as $d) {
     FakeCpanel::$st['addon'][$d] = ['label' => $d, 'dir' => 'public_html/' . $d];
     @mkdir($work . '/home/public_html/' . $d, 0777, true);
     file_put_contents($work . '/home/public_html/' . $d . '/.htaccess', $origHt);
-    file_put_contents($work . '/home/public_html/' . $d . '/index.html', 'old site');
+    file_put_contents($work . '/home/public_html/' . $d . '/php.ini', 'display_errors=Off');
 }
 foreach (['v.com', 'vx.com', 'kd.com', 'nk.com'] as $d) {
     FakeCpanel::$st['parked'][$d] = true;
@@ -282,7 +282,7 @@ Capsule::table(Schema::T_URL)->where('fwd_domain_id', fwdOf('ipx.com')->id)->upd
 $m->moveBatch([rec('ipx.com')->id], $opts, 1);
 ok(rec('ipx.com')->state === 'rolled_back', 'ipx.com in-place rollback verified: ' . rec('ipx.com')->message);
 ok(file_get_contents($work . '/home/public_html/ipx.com/.htaccess') === $origHt && !is_file($work . '/home/public_html/ipx.com/index.php')
-    && is_file($work . '/home/public_html/ipx.com/index.html'), 'ipx.com original .htaccess restored, module index.php removed, old files intact');
+    && is_file($work . '/home/public_html/ipx.com/php.ini'), 'ipx.com original .htaccess restored, module index.php removed, old files intact');
 ok(fwdOf('ipx.com')->status === 'migrating' && isset(FakeCpanel::$st['addon']['ipx.com']), 'ipx.com still on the account, ready to retry');
 
 // 2. Parked domain while Apache is slow: stays "verifying", finished by the cron
@@ -314,6 +314,108 @@ $m->moveBatch([rec('nk.com')->id], $opts, 1);
 ok(rec('nk.com')->state === 'migrated' && strpos(FakeCpanel::$st['default']['nk.com'], ':fail:') === 0, 'without D unknown addresses are rejected');
 Service::setCatchAll(fwdOf('kd.com'), 'all@gmail.com');
 ok(fwdOf('kd.com')->keep_default === null && FakeCpanel::$st['default']['kd.com'] === 'all@gmail.com', 'customer catch-all replaces the kept default');
+
+// ================= v1.4: short steps, interrupted moves, folder safety, parking fallback
+$v14 = ['web.com', 'sh1.com', 'sh2.com', 'int.com', 'int2.com', 'int3.com', 'int4.com', 'pp.com', 'rs.com'];
+foreach ($v14 as $d) {
+    Capsule::table('tbldomains')->insert(['id' => ++$id, 'userid' => 1, 'domain' => $d, 'status' => 'Active', 'emailforwarding' => 0]);
+}
+FakeCpanel::$st['addon']['web.com'] = ['label' => 'web.com', 'dir' => 'public_html/web.com'];
+@mkdir($work . '/home/public_html/web.com', 0777, true);
+file_put_contents($work . '/home/public_html/web.com/index.html', '<h1>a real site</h1>');
+FakeCpanel::$st['addon']['sh1.com'] = ['label' => 'sh1.com', 'dir' => 'public_html/shared'];
+FakeCpanel::$st['addon']['sh2.com'] = ['label' => 'sh2.com', 'dir' => 'public_html/shared'];
+@mkdir($work . '/home/public_html/shared', 0777, true);
+foreach (['int.com', 'int2.com', 'int3.com', 'int4.com', 'pp.com', 'rs.com'] as $d) {
+    FakeCpanel::$st['parked'][$d] = true;
+}
+foreach (['web.com', 'sh1.com', 'sh2.com', 'int.com', 'int2.com', 'int3.com', 'int4.com', 'rs.com'] as $d) {
+    FakeCpanel::$st['redirects'][] = ['domain' => $d, 'sourceurl' => '/', 'destination' => 'https://' . $d . '-dest.org/', 'type' => 'permanent', 'wildcard' => 0, 'matchwww' => 1];
+}
+FakeCpanel::$st['redirects'][] = ['domain' => 'pp.com', 'sourceurl' => '/blog', 'destination' => 'https://blog.pp-dest.org/', 'type' => 'permanent', 'wildcard' => 0, 'matchwww' => 1];
+FakeCpanel::persist();
+$m = Migrator::forServer($sid);
+$m->discover();
+$m->scanBatch(50);
+
+// Risk 1: in-place moves blocked for website folders and shared folders
+ok(rec('web.com')->blocking && strpos(rec('web.com')->issues, 'website files') !== false, 'web.com (real website) blocked: ' . rec('web.com')->issues);
+ok(rec('sh1.com')->blocking && strpos(rec('sh1.com')->issues, 'shared with sh2.com') !== false, 'shared folder blocked: ' . rec('sh1.com')->issues);
+ok(!rec('int.com')->blocking, 'parked domains not affected by the folder check');
+$m->import(Capsule::table(Schema::T_MIGRATION)->whereIn('domain', ['int.com', 'int2.com', 'int3.com', 'int4.com', 'pp.com', 'rs.com'])->pluck('id')->all());
+
+// C: pre-flight cleans up its own folder and older leftovers
+@mkdir($work . '/home/public_html/seekahost_fwd/shfwd-preflight-old0000000.com', 0777, true);
+ok($m->preflight() === '', 'pre-flight ok');
+ok(!glob($work . '/home/public_html/seekahost_fwd/shfwd-preflight-*'), 'pre-flight folders cleaned up: ' . json_encode(glob($work . '/home/public_html/seekahost_fwd/shfwd-preflight-*')));
+
+// C: a request cut off after provisioning -> Resume finishes it
+Migrator::$haltAfter = 'provision';
+$m->moveBatch([rec('int.com')->id], $opts, 1);
+Migrator::$haltAfter = null;
+ok(rec('int.com')->state === 'moving' && !Migrator::isInterrupted(rec('int.com')), 'int.com stuck in moving (not yet flagged)');
+Capsule::table(Schema::T_MIGRATION)->where('domain', 'int.com')->update(['updated_at' => date('Y-m-d H:i:s', time() - 600)]);
+ok(Migrator::isInterrupted(rec('int.com')), 'int.com flagged interrupted');
+list($okR, $msgR) = $m->resume(rec('int.com'));
+ok($okR && rec('int.com')->state === 'migrated' && http('int.com', '/') === [301, 'https://int.com-dest.org/'], 'Resume finished int.com: ' . $msgR);
+
+// C: cut off after provisioning -> Undo restores the old setup
+Migrator::$haltAfter = 'provision';
+$m->moveBatch([rec('int2.com')->id], $opts, 1);
+Migrator::$haltAfter = null;
+Capsule::table(Schema::T_MIGRATION)->where('domain', 'int2.com')->update(['updated_at' => date('Y-m-d H:i:s', time() - 600)]);
+list($okU, $msgU) = $m->undoInterrupted(rec('int2.com'));
+ok($okU && rec('int2.com')->state === 'rolled_back' && isset(FakeCpanel::$st['parked']['int2.com']) && !isset(FakeCpanel::$st['addon']['int2.com'])
+    && http('int2.com', '/') === [301, 'https://int2.com-dest.org/'], 'Undo restored int2.com: ' . $msgU);
+
+// C: interrupted by an older version (row still "imported", domain already moved) -> Resume
+$f3 = fwdOf('int3.com');
+$legacy = new SeekaHost\Forwarding\Migration\CpanelLegacy(new FakeCpanel(Capsule::table(Schema::T_SERVERS)->where('id', $sid)->first()));
+$legacy->detach('int3.com', 'parked', null);
+Capsule::table(Schema::T_DOMAINS)->where('id', $f3->id)->update(['status' => 'pending']);
+Service::provision(Service::reload($f3));
+ok(rec('int3.com')->state === 'imported' && Migrator::isInterrupted(rec('int3.com')), 'legacy interrupted move detected (like transcendcbd.net)');
+list($okL, $msgL) = $m->resume(rec('int3.com'));
+ok($okL && rec('int3.com')->state === 'migrated', 'Resume completed the legacy interrupted move: ' . $msgL);
+
+// C: cut off right after unparking -> Resume provisions and verifies
+Migrator::$haltAfter = 'detach';
+$m->moveBatch([rec('int4.com')->id], $opts, 1);
+Migrator::$haltAfter = null;
+ok(!isset(FakeCpanel::$st['parked']['int4.com']) && !isset(FakeCpanel::$st['addon']['int4.com']), 'int4.com detached and nothing else');
+Capsule::table(Schema::T_MIGRATION)->where('domain', 'int4.com')->update(['updated_at' => date('Y-m-d H:i:s', time() - 600)]);
+list($okD, $msgD) = $m->resume(rec('int4.com'));
+ok($okD && rec('int4.com')->state === 'migrated' && http('int4.com', '/') === [301, 'https://int4.com-dest.org/'], 'Resume after detach: ' . $msgD);
+
+// C: a rollback whose old setup is not live yet becomes "restoring", finished later
+Capsule::table(Schema::T_URL)->where('fwd_domain_id', fwdOf('rs.com')->id)->update(['destination' => 'https://wrong.example/']);
+FakeCpanel::$lag = 0;
+$GLOBALS['shfwd_stale'] = [];
+$m->moveBatch([rec('rs.com')->id], $opts, 1); // mismatch found immediately -> rollback
+ok(in_array(rec('rs.com')->state, ['rolled_back', 'restoring'], true), 'rs.com rolled back: ' . rec('rs.com')->state);
+Capsule::table(Schema::T_MIGRATION)->where('domain', 'rs.com')->update(['state' => 'rolled_back']);
+FakeCpanel::$lag = 100; // web server slow to load the restored setup
+$m->moveBatch([rec('rs.com')->id], $opts, 1);
+ok(rec('rs.com')->state === 'verifying', 'rs.com verifying (slow web server)');
+$GLOBALS['shfwd_stale'] = []; // new setup live -> mismatch -> rollback, old setup slow to come back
+FakeCpanel::$lag = 100;
+Migrator::verifyPendingAll();
+ok(rec('rs.com')->state === 'restoring', 'rs.com restoring while the old setup is not live: ' . rec('rs.com')->message);
+$GLOBALS['shfwd_stale'] = [];
+FakeCpanel::$lag = 0;
+Migrator::verifyPendingAll();
+ok(rec('rs.com')->state === 'rolled_back' && http('rs.com', '/') === [301, 'https://rs.com-dest.org/'], 'rs.com restored and verified later: ' . rec('rs.com')->message);
+
+// Risk 3: unmatched paths show the parking page
+$m->moveBatch([rec('pp.com')->id], $opts, 1);
+ok(rec('pp.com')->state === 'migrated', 'pp.com migrated: ' . rec('pp.com')->message);
+ok(http('pp.com', '/blog') === [301, 'https://blog.pp-dest.org/'] && http('pp.com', '/')[0] === 200 && http('pp.com', '/nothing-here')[0] === 404, 'parking page for unmatched paths (200 on /, 404 elsewhere)');
+
+// Risk 2: a failing .htaccess read never blocks a normal deploy
+FakeCpanel::$failOn['Fileman::get_file_content'] = 'Unexpected cPanel answer';
+Service::saveUrl(fwdOf('a.com'), ['source_path' => '/shop', 'destination' => 'https://shop.example.org/']);
+unset(FakeCpanel::$failOn['Fileman::get_file_content']);
+ok(http('a.com', '/shop') === [301, 'https://shop.example.org/'], 'normal deploy works even if reading .htaccess fails');
 
 // ---- access mode switch
 Migrator::setAccessModeAll();

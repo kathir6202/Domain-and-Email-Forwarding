@@ -130,7 +130,7 @@ class CpanelLegacy
     }
 
     /** Remove the legacy domain from the account; its .htaccess redirects stay on disk untouched. */
-    public function detach($domain, $kind, array $addonRow = null)
+    public function detach($domain, $kind, ?array $addonRow = null)
     {
         if ($kind === 'parked') {
             $this->cp->call(2, 'Park', 'unpark', ['domain' => $domain]);
@@ -148,7 +148,7 @@ class CpanelLegacy
     }
 
     /** Put the legacy domain back exactly where it was (redirects come back with it). */
-    public function reattach($domain, $kind, array $addonRow = null)
+    public function reattach($domain, $kind, ?array $addonRow = null)
     {
         if ($kind === 'parked') {
             $this->cp->call(2, 'Park', 'park', ['domain' => $domain]);
@@ -185,6 +185,73 @@ class CpanelLegacy
     private function abs($dir)
     {
         return strpos($dir, '/') === 0 ? rtrim($dir, '/') : rtrim($this->cp->home(), '/') . '/' . trim($dir, '/');
+    }
+
+    /** Absolute path of a folder given relative to the account's home directory. */
+    public function absPath($dir)
+    {
+        return $this->abs($dir);
+    }
+
+    /** @return array absolute document root => domains using it (main, addon, sub and parked domains) */
+    public function docrootMap()
+    {
+        $map = [];
+        $add = function ($root, $domain) use (&$map) {
+            $root = rtrim((string) $root, '/');
+            if ($root !== '' && $domain !== '') {
+                $map[$root][] = strtolower((string) $domain);
+            }
+        };
+        $data = (array) $this->cp->call(3, 'DomainInfo', 'domains_data', ['format' => 'hash']);
+        $mainRoot = isset($data['main_domain']['documentroot']) ? $data['main_domain']['documentroot'] : $this->abs('public_html');
+        if (!empty($data['main_domain']['domain'])) {
+            $add($mainRoot, $data['main_domain']['domain']);
+        }
+        foreach (['addon_domains', 'sub_domains'] as $key) {
+            foreach ((array) (isset($data[$key]) ? $data[$key] : []) as $row) {
+                if (is_array($row) && !empty($row['domain'])) {
+                    $add(isset($row['documentroot']) ? $row['documentroot'] : '', $row['domain']);
+                }
+            }
+        }
+        foreach ((array) (isset($data['parked_domains']) ? $data['parked_domains'] : []) as $row) {
+            if (is_array($row)) {
+                $add(isset($row['documentroot']) ? $row['documentroot'] : $mainRoot, isset($row['domain']) ? $row['domain'] : '');
+            } else {
+                $add($mainRoot, $row);
+            }
+        }
+        foreach ($map as $root => $domains) {
+            $map[$root] = array_values(array_unique($domains));
+        }
+        return $map;
+    }
+
+    /** @return string[] names of the entries in a folder (relative to home), hidden ones included */
+    public function listFolder($dir)
+    {
+        $names = [];
+        foreach ((array) $this->cp->call(3, 'Fileman', 'list_files', ['dir' => $this->abs($dir), 'show_hidden' => 1]) as $row) {
+            $name = is_array($row) ? (isset($row['file']) ? $row['file'] : (isset($row['fullpath']) ? basename($row['fullpath']) : '')) : (string) $row;
+            if ($name !== '' && $name !== '.' && $name !== '..') {
+                $names[] = $name;
+            }
+        }
+        return $names;
+    }
+
+    /** Best effort: delete a file or folder (relative to home). */
+    public function deletePath($path)
+    {
+        foreach (['unlink', 'trash'] as $op) {
+            try {
+                $this->cp->call(2, 'Fileman', 'fileop', ['op' => $op, 'sourcefiles' => $this->abs($path), 'doubledecode' => 0]);
+                return;
+            } catch (\Throwable $e) {
+                // try the next way
+            }
+        }
     }
 
     /** @return string|null content of a file in the account (dir relative to home), null if missing */

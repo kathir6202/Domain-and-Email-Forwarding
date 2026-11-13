@@ -5,7 +5,7 @@ if (!defined('WHMCS')) {
 }
 
 if (!defined('SEEKAHOST_FWD_VERSION')) {
-    define('SEEKAHOST_FWD_VERSION', '1.3.0');
+    define('SEEKAHOST_FWD_VERSION', '1.4.0');
     define('SEEKAHOST_FWD_MODULE', 'seekahost_forwarding');
 
     spl_autoload_register(function ($class) {

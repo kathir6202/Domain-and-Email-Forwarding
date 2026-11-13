@@ -21,12 +21,12 @@ class Input
     }
 
     /** Decoded copy of $_POST (or another array). */
-    public static function all(array $source = null)
+    public static function all(?array $source = null)
     {
         return self::decode($source === null ? $_POST : $source);
     }
 
-    public static function get($key, $default = '', array $source = null)
+    public static function get($key, $default = '', ?array $source = null)
     {
         $source = $source === null ? $_REQUEST : $source;
         return isset($source[$key]) ? self::decode($source[$key]) : $default;
