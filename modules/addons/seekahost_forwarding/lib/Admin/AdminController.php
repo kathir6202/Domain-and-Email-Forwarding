@@ -283,6 +283,9 @@ class AdminController
     private function postDomain($op)
     {
         $in = $this->in;
+        if (strpos($op, 'remove_parked') === 0) {
+            $this->postRemoveParked($op);
+        }
         if ($op === 'open') {
             $name = Validator::toAscii(isset($in['domain']) ? $in['domain'] : '');
             $row = Capsule::table('tbldomains')->where('domain', $name)->orderBy('id', 'desc')->first();
@@ -368,6 +371,62 @@ class AdminController
                 Service::setDomainForwarder($fwd, isset($in['domain_forward']) ? $in['domain_forward'] : '');
                 $this->flash('success', 'Domain email forwarding saved.');
                 break;
+        }
+        $this->redirect($back);
+    }
+
+    /**
+     * Remove unused parked domains (parked, no redirects or email forwarders) from the server, selected or all.
+     * Runs in short steps (about 15 s each) that continue automatically, so long lists never hit web server time limits.
+     */
+    private function postRemoveParked($op)
+    {
+        $back = ['action' => 'domains'];
+        if ($op === 'remove_parked_stop') {
+            unset($_SESSION['shfwd_unpark']);
+            $this->flash('success', 'Stopped. Domains already removed stay removed.');
+            $this->redirect($back);
+        }
+        if ($op !== 'remove_parked_continue') {
+            if ($op === 'remove_parked_all') {
+                $ids = Service::idleParkedIds();
+            } else {
+                $ids = isset($this->in['ids']) && is_array($this->in['ids']) ? $this->in['ids'] : [];
+                $ids = array_values(array_unique(array_filter(array_map('intval', $ids))));
+            }
+            if (!$ids) {
+                Validator::fail('No unused parked domains were selected.');
+            }
+            $_SESSION['shfwd_unpark'] = ['queue' => $ids, 'done' => 0, 'skipped' => 0, 'errors' => []];
+        }
+        $job = isset($_SESSION['shfwd_unpark']) && is_array($_SESSION['shfwd_unpark']) ? $_SESSION['shfwd_unpark'] : null;
+        if (!$job) {
+            $this->redirect($back);
+        }
+        $start = microtime(true);
+        while ($job['queue'] && microtime(true) - $start < 15) {
+            $fwd = Capsule::table(Schema::T_DOMAINS)->where('id', (int) array_shift($job['queue']))->first();
+            if (!$fwd || !Service::isIdleParked($fwd)) {
+                $job['skipped']++;
+                continue;
+            }
+            try {
+                Service::removeIdleParked($fwd);
+                $job['done']++;
+            } catch (\Throwable $e) {
+                $job['errors'][] = $fwd->domain . ': ' . $e->getMessage();
+            }
+        }
+        if ($job['queue']) {
+            $_SESSION['shfwd_unpark'] = $job;
+            $back['continue'] = 'unpark';
+            $this->redirect($back);
+        }
+        unset($_SESSION['shfwd_unpark']);
+        $this->flash('success', $job['done'] . ' parked domain(s) removed from the server.'
+            . ($job['skipped'] ? ' ' . $job['skipped'] . ' skipped (no longer parked, or now in use).' : ''));
+        if ($job['errors']) {
+            $this->flash('error', count($job['errors']) . ' failed (see Logs): ' . implode('; ', array_slice($job['errors'], 0, 5)));
         }
         $this->redirect($back);
     }
@@ -460,6 +519,11 @@ class AdminController
         if ($serverId) {
             $q->where('d.server_id', $serverId);
         }
+        $idle = (string) $this->q('idle') === '1';
+        if ($idle) {
+            Service::scopeIdleParked($q, 'd');
+        }
+        $idleTotal = Service::scopeIdleParked(Capsule::table(Schema::T_DOMAINS . ' as d'))->count();
         $page = max(1, (int) $this->q('page', 1));
         $total = (clone $q)->count();
         $rows = $q->orderBy('d.domain')->offset(($page - 1) * self::PER_PAGE)->limit(self::PER_PAGE)->get()->all();
@@ -481,15 +545,39 @@ class AdminController
         echo '<form method="get" class="form-inline" style="margin-bottom:10px"><input type="hidden" name="module" value="seekahost_forwarding">'
             . '<input type="hidden" name="action" value="domains"><input type="text" name="q" class="form-control" placeholder="Domain, client name/email or ID" value="'
             . self::e($search) . '"> <select name="status" class="form-control">' . $statusOptions . '</select> <select name="server" class="form-control">'
-            . $serverOptions . '</select> <button class="btn btn-default">Search</button></form>';
+            . $serverOptions . '</select> <label style="font-weight:normal"><input type="checkbox" name="idle" value="1"' . ($idle ? ' checked' : '')
+            . '> Unused parked only (' . (int) $idleTotal . ')</label> <button class="btn btn-default">Search</button></form>';
         $this->openDomainForm();
 
-        echo '<table class="table table-striped table-condensed"><thead><tr><th>Domain</th><th>Client</th><th>Server</th><th>Status</th><th>SSL</th>'
+        $list = $this->url(['action' => 'domains']);
+        if ((string) $this->q('continue') === 'unpark' && !empty($_SESSION['shfwd_unpark']['queue'])) {
+            echo '<form method="post" id="shfwd-continue" action="' . self::e($list) . '">' . $this->token()
+                . '<input type="hidden" name="op" value="remove_parked_continue"></form>'
+                . '<div class="alert alert-info">Removing parked domains&hellip; ' . (int) $_SESSION['shfwd_unpark']['done'] . ' done, '
+                . count($_SESSION['shfwd_unpark']['queue']) . ' left. The next step starts automatically. '
+                . '<form method="post" class="inline" action="' . self::e($list) . '">' . $this->token()
+                . '<input type="hidden" name="op" value="remove_parked_stop"><button class="btn btn-xs btn-sm btn-default">Stop</button></form></div>'
+                . '<script>setTimeout(function(){document.getElementById("shfwd-continue").submit();}, 800);</script>';
+        }
+
+        $confirm = 'Remove the selected parked domains from the server? They have no redirects or email forwarders. '
+            . 'They stay in the module, and adding a forwarder later sets them up again.';
+        echo '<form method="post" id="shfwd-bulk" action="' . self::e($list) . '" onsubmit="return confirm(\'' . self::e($confirm) . '\')">'
+            . $this->token() . '<input type="hidden" name="op" value="remove_parked">';
+        echo '<table class="table table-striped table-condensed"><thead><tr>'
+            . '<th><input type="checkbox" title="Select all unused parked domains on this page" '
+            . 'onclick="var c=this.checked;Array.prototype.forEach.call(document.querySelectorAll(\'#shfwd-bulk .shfwd-idle\'),function(b){b.checked=c;});"></th>'
+            . '<th>Domain</th><th>Client</th><th>Server</th><th>Status</th><th>SSL</th>'
             . '<th>URL</th><th>Email</th><th>Catch-all</th><th>Last Error</th><th></th></tr></thead><tbody>';
         foreach ($rows as $r) {
             $client = trim($r->firstname . ' ' . $r->lastname) . ($r->companyname ? ' (' . $r->companyname . ')' : '');
-            echo '<tr><td><a href="clientsdomains.php?userid=' . (int) $r->client_id . '&id=' . (int) $r->domain_id . '">' . self::e(Validator::toUnicode($r->domain)) . '</a>'
-                . ($r->parked ? ' <span class="label label-info badge badge-info">Parked</span>' : '') . '</td>'
+            $unused = $r->parked && !$r->catchall && !$r->domain_forward && !in_array($r->status, ['disabled', 'migrating'], true)
+                && empty($urlCounts[$r->id]) && empty($emailCounts[$r->id]);
+            $since = $unused && !empty($r->parked_at) ? (int) floor((time() - strtotime($r->parked_at)) / 86400) : null;
+            echo '<tr><td>' . ($unused ? '<input type="checkbox" class="shfwd-idle" name="ids[]" value="' . (int) $r->id . '">' : '') . '</td>'
+                . '<td><a href="clientsdomains.php?userid=' . (int) $r->client_id . '&id=' . (int) $r->domain_id . '">' . self::e(Validator::toUnicode($r->domain)) . '</a>'
+                . ($r->parked ? ' <span class="label label-info badge badge-info">Parked</span>' : '')
+                . ($unused ? ' <small class="text-muted">unused' . ($since !== null ? ' ' . max(0, $since) . ' d' : '') . '</small>' : '') . '</td>'
                 . '<td><a href="clientssummary.php?userid=' . (int) $r->client_id . '">' . self::e($client ?: '#' . $r->client_id) . '</a></td>'
                 . '<td>' . self::e($r->server_name ?: '-') . '</td><td>' . $this->statusLabel($r->status) . '</td>'
                 . '<td>' . self::e($r->ssl_status ?: '-') . '</td>'
@@ -500,10 +588,20 @@ class AdminController
                 . '<td><a class="btn btn-xs btn-sm btn-primary" href="' . self::e($this->url(['action' => 'domain', 'fid' => $r->id])) . '">Manage</a></td></tr>';
         }
         if (!$rows) {
-            echo '<tr><td colspan="10" class="text-center">No forwarding domains found.</td></tr>';
+            echo '<tr><td colspan="11" class="text-center">No forwarding domains found.</td></tr>';
         }
-        echo '</tbody></table>';
-        $this->pager($total, $page, ['action' => 'domains', 'q' => $search, 'status' => $status, 'server' => $serverId ?: '']);
+        echo '</tbody></table>' . ($idleTotal ? '<button class="btn btn-warning">Remove selected parked domains</button>' : '') . '</form>';
+        if ($idleTotal) {
+            $days = Settings::int('park_remove_days');
+            echo ' <form method="post" class="inline" action="' . self::e($list) . '" onsubmit="return confirm(\'Remove all '
+                . (int) $idleTotal . ' unused parked domains from the server? They stay in the module.\')">' . $this->token()
+                . '<input type="hidden" name="op" value="remove_parked_all"><button class="btn btn-danger">Remove all unused parked domains ('
+                . (int) $idleTotal . ')</button></form>'
+                . '<p class="text-muted" style="margin-top:6px"><small>Unused parked = parked with no redirects, email forwarders, catch-all or domain email forwarding. '
+                . ($days ? 'They are also removed automatically after ' . $days . ' days unused (setting: Remove Unused Parked Domains).' : 'Automatic removal is off (setting: Remove Unused Parked Domains = 0).')
+                . '</small></p>';
+        }
+        $this->pager($total, $page, ['action' => 'domains', 'q' => $search, 'status' => $status, 'server' => $serverId ?: '', 'idle' => $idle ? 1 : '']);
     }
 
     private function statusLabel($status)

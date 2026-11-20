@@ -32,6 +32,7 @@ class Settings
         'parking_html' => '',
         'api_enabled' => '',
         'migration_wait' => '10',
+        'park_remove_days' => '60',
     ];
 
     public static function all()

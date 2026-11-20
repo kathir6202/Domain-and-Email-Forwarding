@@ -24,6 +24,9 @@ class Service
     const URL_TYPES = ['301' => 'Permanent (301)', '302' => 'Temporary (302)', '303' => 'See Other (303)', 'masked' => 'Masked (Frame)'];
     const WWW_MODES = ['both' => 'With or without www.', 'www' => 'Only with www.', 'nowww' => 'Only without www.'];
 
+    /** @var bool|null whether the parked_at column exists (schema 1.5.0+) */
+    private static $hasParkedAt;
+
     /* ---------------------------------------------------------------- lookup */
 
     public static function domainRow($domainId)
@@ -386,14 +389,15 @@ class Service
         }
         Capsule::table(Schema::T_URL)->where('fwd_domain_id', $fwd->id)->delete();
         Capsule::table(Schema::T_EMAIL)->where('fwd_domain_id', $fwd->id)->delete();
-        self::touch($fwd, ['client_id' => $newClientId, 'catchall' => null, 'domain_forward' => null, 'parked' => 0, 'status' => 'pending']);
+        self::touch($fwd, ['client_id' => $newClientId, 'catchall' => null, 'domain_forward' => null, 'parked' => 0, 'status' => 'pending'] + self::parkedAt(null));
         Logger::log('owner_change', $fwd->domain . ' moved from client #' . $fwd->client_id . ' to #' . $newClientId . '; forwarders reset', 'info', $newClientId, $fwd->domain_id, 'system');
         return self::reload($fwd);
     }
 
     public static function park($fwd)
     {
-        self::touch($fwd, ['parked' => 1]);
+        $since = $fwd->parked && !empty($fwd->parked_at) ? $fwd->parked_at : date('Y-m-d H:i:s');
+        self::touch($fwd, ['parked' => 1] + self::parkedAt($since));
         $fwd = self::reload($fwd);
         if ($fwd->status === 'active') {
             self::deployWeb($fwd);
@@ -404,12 +408,134 @@ class Service
 
     public static function unpark($fwd)
     {
-        self::touch($fwd, ['parked' => 0]);
+        self::touch($fwd, ['parked' => 0] + self::parkedAt(null));
         $fwd = self::reload($fwd);
         if (in_array($fwd->status, ['active', 'error'], true) && !self::hasContent($fwd)) {
             $fwd = self::unprovision($fwd, 'pending', 'unparked');
         }
         return $fwd;
+    }
+
+    /** ['parked_at' => $value], or nothing until the 1.5.0 schema upgrade has run. */
+    private static function parkedAt($value)
+    {
+        if (self::$hasParkedAt === null) {
+            try {
+                self::$hasParkedAt = Capsule::schema()->hasColumn(Schema::T_DOMAINS, 'parked_at');
+            } catch (\Throwable $e) {
+                self::$hasParkedAt = false;
+            }
+        }
+        return self::$hasParkedAt ? ['parked_at' => $value] : [];
+    }
+
+    /** Parked with nothing else in use: no URL or email forwarders, catch-all or domain email forwarding. */
+    public static function isIdleParked($fwd)
+    {
+        return $fwd->parked && !$fwd->catchall && !$fwd->domain_forward
+            && !in_array($fwd->status, ['disabled', 'migrating'], true)
+            && !Capsule::table(Schema::T_URL)->where('fwd_domain_id', $fwd->id)->exists()
+            && !Capsule::table(Schema::T_EMAIL)->where('fwd_domain_id', $fwd->id)->exists();
+    }
+
+    /** Limit a query on the domains table (aliased $alias) to unused parked domains, as isIdleParked(). */
+    public static function scopeIdleParked($q, $alias = 'd')
+    {
+        return $q->where($alias . '.parked', 1)
+            ->whereNotIn($alias . '.status', ['disabled', 'migrating'])
+            ->where(function ($w) use ($alias) {
+                $w->whereNull($alias . '.catchall')->orWhere($alias . '.catchall', '');
+            })
+            ->where(function ($w) use ($alias) {
+                $w->whereNull($alias . '.domain_forward')->orWhere($alias . '.domain_forward', '');
+            })
+            ->whereNotExists(function ($w) use ($alias) {
+                $w->select(Capsule::raw(1))->from(Schema::T_URL)->whereColumn(Schema::T_URL . '.fwd_domain_id', $alias . '.id');
+            })
+            ->whereNotExists(function ($w) use ($alias) {
+                $w->select(Capsule::raw(1))->from(Schema::T_EMAIL)->whereColumn(Schema::T_EMAIL . '.fwd_domain_id', $alias . '.id');
+            });
+    }
+
+    /** @return int[] ids of every unused parked domain */
+    public static function idleParkedIds()
+    {
+        $ids = self::scopeIdleParked(Capsule::table(Schema::T_DOMAINS . ' as d'))->orderBy('d.domain')->pluck('d.id');
+        return array_map('intval', is_array($ids) ? $ids : $ids->all());
+    }
+
+    /** Remove one unused parked domain from the server (admin bulk action). The module record is kept. */
+    public static function removeIdleParked($fwd)
+    {
+        $fwd = self::unpark($fwd);
+        Logger::log('unpark', $fwd->domain . ' unused parked domain removed from the server', 'info', $fwd->client_id, $fwd->domain_id);
+        return $fwd;
+    }
+
+    /**
+     * Daily: track how long a parked domain has had nothing else in use (parked_at) and remove it from the server
+     * after the configured number of days. @return bool true when it was removed
+     */
+    private static function expireIdleParked($fwd)
+    {
+        if (!self::parkedAt(null)) {
+            return false;
+        }
+        if (!self::isIdleParked($fwd)) {
+            if (!empty($fwd->parked_at)) {
+                self::touch($fwd, ['parked_at' => null]);
+            }
+            return false;
+        }
+        if (empty($fwd->parked_at)) {
+            self::touch($fwd, ['parked_at' => date('Y-m-d H:i:s')]);
+            return false;
+        }
+        $days = Settings::int('park_remove_days');
+        if ($days < 1 || strtotime($fwd->parked_at) > strtotime('-' . $days . ' days')) {
+            return false;
+        }
+        self::unpark($fwd);
+        Logger::log('auto_unpark', $fwd->domain . ' removed from the server: parked with no redirects or email forwarders for '
+            . $days . ' days', 'info', $fwd->client_id, $fwd->domain_id, 'system');
+        return true;
+    }
+
+    /**
+     * Every cron run: a domain whose Email Forwarding addon was turned off (by the client or an admin) is removed
+     * from the server. Its rules are kept, so turning the addon on again restores them (daily cron).
+     */
+    public static function suspendWithoutAddon($limit = 25)
+    {
+        if (Settings::get('access_mode') === 'all') {
+            return 0;
+        }
+        $rows = Capsule::table(Schema::T_DOMAINS . ' as f')
+            ->join('tbldomains as d', 'd.id', '=', 'f.domain_id')
+            ->whereIn('f.status', ['active', 'error'])
+            ->select('f.id', 'd.emailforwarding as addon_flag')
+            ->get()->all();
+        $n = 0;
+        foreach ($rows as $row) {
+            if (!empty($row->addon_flag) || $n >= $limit) {
+                continue;
+            }
+            $fwd = Capsule::table(Schema::T_DOMAINS)->where('id', $row->id)->first();
+            if (!$fwd) {
+                continue;
+            }
+            try {
+                list($ok, $reason) = self::access(self::domainRow($fwd->domain_id));
+                if (!$ok) {
+                    self::unprovision($fwd, 'suspended', $reason);
+                    $n++;
+                }
+            } catch (\Throwable $e) {
+                Logger::log('cron', $fwd->domain . ': ' . $e->getMessage(), 'error', $fwd->client_id, $fwd->domain_id, 'system');
+                $n++;
+            }
+        }
+        return $n;
     }
 
     /** @param bool $quiet expected failures (DNS not pointed) are logged without alerts */
@@ -812,6 +938,9 @@ class Service
                 }
                 $fwd = self::fwdDomain($domainRow, false);
                 if (!$fwd || in_array($fwd->status, ['disabled', 'migrating'], true)) {
+                    continue;
+                }
+                if (self::expireIdleParked($fwd)) {
                     continue;
                 }
                 list($ok, $reason) = self::access($domainRow);

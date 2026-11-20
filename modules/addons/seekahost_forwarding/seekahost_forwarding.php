@@ -116,6 +116,14 @@ function seekahost_forwarding_config()
                 'Type' => 'yesno',
                 'Description' => 'Allow token-authenticated API access (manage tokens under Addons &gt; this module &gt; API).',
             ],
+            'park_remove_days' => [
+                'FriendlyName' => 'Remove Unused Parked Domains (days)',
+                'Type' => 'text',
+                'Size' => '5',
+                'Default' => '60',
+                'Description' => 'A parked domain with no redirects and no email forwarders is removed from the server after this many days '
+                    . '(daily cron). It stays in the module, so adding a forwarder later sets it up again. 0 = never.',
+            ],
             'migration_wait' => [
                 'FriendlyName' => 'Migration: Web Server Wait (seconds)',
                 'Type' => 'text',

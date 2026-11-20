@@ -58,6 +58,16 @@ foreach (['dashboard', 'domains', 'domain', 'servers', 'server', 'tlds', 'api', 
 }
 $_GET = $_REQUEST = ['module' => 'seekahost_forwarding', 'action' => 'domains', 'q' => 'Ann', 'status' => 'active'];
 ob_start(); (new AdminController(['modulelink' => 'm']))->dispatch(); check(ob_get_clean(), 'admin:search', ['example.com']);
+Capsule::table(Schema::T_DOMAINS)->insert(['domain_id' => 11, 'client_id' => 1, 'domain' => 'idle.com', 'server_id' => 1, 'status' => 'active', 'parked' => 1,
+    'parked_at' => date('Y-m-d H:i:s', strtotime('-5 days -1 hour'))]);
+$_GET = $_REQUEST = ['module' => 'seekahost_forwarding', 'action' => 'domains', 'idle' => '1'];
+ob_start(); (new AdminController(['modulelink' => 'm']))->dispatch(); $h = ob_get_clean();
+check($h, 'admin:idle', ['idle.com', 'unused 5 d', 'shfwd-idle', 'Remove selected parked domains', 'Remove all unused parked domains (1)', 'remove_parked_all', 'Unused parked only (1)']);
+if (strpos($h, '>example.com</a>') !== false) { $errors++; echo "admin:idle filter shows a domain that is in use\n"; }
+$_SESSION['shfwd_unpark'] = ['queue' => [5], 'done' => 2, 'skipped' => 0, 'errors' => []];
+$_GET = $_REQUEST = ['module' => 'seekahost_forwarding', 'action' => 'domains', 'continue' => 'unpark'];
+ob_start(); (new AdminController(['modulelink' => 'm']))->dispatch(); check(ob_get_clean(), 'admin:unpark-continue', ['remove_parked_continue', '2 done, 1 left', 'remove_parked_stop']);
+unset($_SESSION['shfwd_unpark']);
 
 // ---- hooks
 $out = $GLOBALS['hooks']['AdminClientDomainsTabFields'][0](['id' => 10]);

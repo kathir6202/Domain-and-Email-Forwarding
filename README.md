@@ -35,6 +35,7 @@ Supports WHMCS 8.13.x and 9.0.x on PHP 7.4 – 8.3. The client area works with t
 - **Domains & Forwarders:**
   - search by domain, client name, email or ID, and filter by status or server
   - per-domain management: forwarders, limit overrides, server choice, **Sync to Server**, **Check Server**, **Park/Unpark**, **Request SSL**, **Remove from Server & Disable**, and **Delete** (with a force option)
+  - **unused parked domains** (parked, with no redirects, email forwarders, catch-all or domain email forwarding): filter them with **Unused parked only**, see how many days each has been unused, and remove them from the server in bulk (**Remove selected parked domains**) or in one click (**Remove all unused parked domains**). The domains stay in the module, so adding a forwarder later sets them up again. Long lists are processed in short steps that continue automatically.
 - **Servers:** cPanel/WHM, DirectAdmin and Plesk, with a connection test that covers the API and FTP, and SSL certificate verification.
 - **TLD Settings:** per-TLD permissions (URL, directory, email, domain-email and catch-all forwarders, or **park only**) and an **automatic action** after registration or transfer (park, or create a URL forwarder to a URL containing `{domain}`).
 - **API:** token management with IP and CIDR restrictions.
@@ -47,8 +48,10 @@ Supports WHMCS 8.13.x and 9.0.x on PHP 7.4 – 8.3. The client area works with t
   - restores them when they qualify again
   - retries failed operations
   - removes domains that no longer have any forwarders
+  - removes **unused parked domains** from the server after *Remove Unused Parked Domains (days)* (default 60, 0 = never). The count starts when a domain is parked with nothing in use; for domains parked before version 1.5.0 it starts on the first daily cron run after the upgrade. Each removal is logged as `auto_unpark`.
   - restores domains that disappeared from the server
   - retries SSL
+- When the **Email Forwarding addon is turned off** (by the client or an admin), the domain and all its redirects and email forwarders are removed from the server at the next cron run (about 5 minutes). Its rules are kept in the module, so turning the addon on again restores them at the daily cron.
 - When a **hosting account** is created for a forwarded domain, the domain is first released from the forwarding server.
 - When a domain **moves to another client**, the previous owner's forwarders are wiped.
 - When a domain is **deleted** in WHMCS, it is removed from the server.

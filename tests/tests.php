@@ -306,4 +306,76 @@ Capsule::table('tbldomains')->insert(['id' => 32, 'userid' => 1, 'domain' => 'po
 Service::autoSetup(32);
 ok(fwdOf(32) && fwdOf(32)->parked == 1, 'park-only + forward action parks');
 
+// ---- 1.5.0: unused parked domains (manual + automatic removal)
+Tld::save(['.com' => ['allow_url' => 1, 'allow_path' => 1, 'allow_email' => 1, 'allow_catchall' => 1, 'allow_domain_email' => 1]]); tldReset();
+setting('access_mode', 'addon');
+foreach ([40 => 'idle1.com', 41 => 'busy1.com', 42 => 'idle2.com', 43 => 'idle3.com', 44 => 'addon1.com'] as $id => $d) {
+    Capsule::table('tbldomains')->insert(['id' => $id, 'userid' => 1, 'domain' => $d, 'status' => 'Active', 'emailforwarding' => 1]);
+}
+ok(Capsule::schema()->hasColumn(Schema::T_DOMAINS, 'parked_at'), 'parked_at column installed');
+$cfg = seekahost_forwarding_config();
+ok(isset($cfg['fields']['park_remove_days']) && Settings::int('park_remove_days') === 60, 'park_remove_days setting, default 60');
+Service::park(Service::fwdDomain(Service::domainRow(40)));
+ok(fwdOf(40)->parked == 1 && fwdOf(40)->status === 'active' && !empty(fwdOf(40)->parked_at) && isset(FakePanel::$domains['idle1.com']), 'park records parked_at');
+$since = fwdOf(40)->parked_at;
+Service::park(fwdOf(40));
+ok(fwdOf(40)->parked_at === $since, 'parking again keeps parked_at');
+Service::park(Service::fwdDomain(Service::domainRow(41)));
+Service::saveUrl(fwdOf(41), ['source_path' => '/', 'destination' => 'https://busy.example/']);
+Service::park(Service::fwdDomain(Service::domainRow(42)));
+Service::park(Service::fwdDomain(Service::domainRow(43)));
+ok(Service::isIdleParked(fwdOf(40)) && !Service::isIdleParked(fwdOf(41)), 'isIdleParked: url forwarder counts as in use');
+$idle = Service::idleParkedIds();
+ok(in_array((int) fwdOf(40)->id, $idle, true) && !in_array((int) fwdOf(41)->id, $idle, true) && in_array((int) fwdOf(43)->id, $idle, true), 'idleParkedIds matches isIdleParked');
+Service::setCatchAll(fwdOf(43), 'c@other.com');
+ok(!Service::isIdleParked(fwdOf(43)) && !in_array((int) fwdOf(43)->id, Service::idleParkedIds(), true), 'catch-all counts as in use');
+Service::setCatchAll(fwdOf(43), '');
+ok(Service::isIdleParked(fwdOf(43)), 'idle again after catch-all cleared');
+
+$old = date('Y-m-d H:i:s', strtotime('-61 days'));
+Capsule::table(Schema::T_DOMAINS)->whereIn('domain_id', [40, 41])->update(['parked_at' => $old]);
+Capsule::table(Schema::T_DOMAINS)->where('domain_id', 42)->update(['parked_at' => null]); // parked before the upgrade
+Capsule::table(Schema::T_DOMAINS)->where('domain_id', 43)->update(['parked_at' => date('Y-m-d H:i:s', strtotime('-59 days'))]);
+Service::cron();
+ok(fwdOf(40)->parked == 0 && fwdOf(40)->status === 'pending' && empty(fwdOf(40)->parked_at) && !isset(FakePanel::$domains['idle1.com']), 'cron removes parked domain unused for 61 days');
+ok(Capsule::table('mod_seekahost_forwarding_logs')->where('action', 'auto_unpark')->where('domain_id', 40)->exists(), 'auto removal logged');
+ok(fwdOf(41)->parked == 1 && fwdOf(41)->status === 'active' && fwdOf(41)->parked_at === null && isset(FakePanel::$domains['busy1.com']), 'parked domain with forwarders kept; counter reset');
+ok(fwdOf(42)->parked == 1 && !empty(fwdOf(42)->parked_at) && strtotime(fwdOf(42)->parked_at) > time() - 120 && isset(FakePanel::$domains['idle2.com']), 'pre-upgrade parked: counting starts now');
+ok(fwdOf(43)->parked == 1 && isset(FakePanel::$domains['idle3.com']), '59 days: not removed yet');
+setting('park_remove_days', '0');
+Capsule::table(Schema::T_DOMAINS)->where('domain_id', 43)->update(['parked_at' => $old]);
+Service::cron();
+ok(fwdOf(43)->parked == 1 && isset(FakePanel::$domains['idle3.com']), 'park_remove_days = 0 disables automatic removal');
+setting('park_remove_days', '60');
+
+// manual removal (admin bulk action uses removeIdleParked per domain)
+Service::removeIdleParked(fwdOf(43));
+ok(fwdOf(43)->parked == 0 && fwdOf(43)->status === 'pending' && !isset(FakePanel::$domains['idle3.com']), 'manual removal: off the server, record kept');
+ok(Capsule::table(Schema::T_DOMAINS)->where('domain_id', 43)->exists(), 'manual removal keeps module record');
+Service::saveUrl(fwdOf(43), ['source_path' => '/', 'destination' => 'https://back.example/']);
+ok(fwdOf(43)->status === 'active' && isset(FakePanel::$domains['idle3.com']), 'adding a forwarder later sets it up again');
+
+// ---- 1.5.0: Email Forwarding addon turned off -> removed within one cron run (rules kept)
+$f44 = Service::fwdDomain(Service::domainRow(44));
+Service::saveUrl($f44, ['source_path' => '/', 'destination' => 'https://a1.example/']);
+Service::saveEmail(fwdOf(44), ['local_part' => 'info', 'destinations' => 'i@other.com']);
+ok(fwdOf(44)->status === 'active' && FakePanel::$domains['addon1.com']['mail']['info'] === ['i@other.com'], 'addon1 active with email');
+ok(Service::suspendWithoutAddon() === 0, 'addon check: nothing to do while addon on');
+Capsule::table('tbldomains')->where('id', 44)->update(['emailforwarding' => 0]);
+setting('access_mode', 'all');
+ok(Service::suspendWithoutAddon() === 0 && fwdOf(44)->status === 'active', 'addon check skipped in "all domains" mode');
+setting('access_mode', 'addon');
+ok(Service::suspendWithoutAddon() === 1, 'addon check suspends one');
+ok(fwdOf(44)->status === 'suspended' && !isset(FakePanel::$domains['addon1.com']), 'addon off: removed from the server (incl. email)');
+ok(Capsule::table(Schema::T_URL)->where('fwd_domain_id', fwdOf(44)->id)->count() === 1 && Capsule::table(Schema::T_EMAIL)->where('fwd_domain_id', fwdOf(44)->id)->count() === 1, 'addon off: rules kept');
+ok(Service::suspendWithoutAddon() === 0, 'addon check idempotent');
+Capsule::table('tbldomains')->where('id', 44)->update(['emailforwarding' => 1]);
+Service::cron();
+ok(fwdOf(44)->status === 'active' && FakePanel::$domains['addon1.com']['mail']['info'] === ['i@other.com'], 'addon on again: restored by daily cron');
+require_once dirname(__DIR__) . '/modules/addons/seekahost_forwarding/hooks.php';
+Capsule::table('tbldomains')->where('id', 44)->update(['emailforwarding' => 0]);
+foreach ($GLOBALS['hooks']['AfterCronJob'] as $hook) { $hook([]); }
+ok(fwdOf(44)->status === 'suspended' && !isset(FakePanel::$domains['addon1.com']), 'AfterCronJob hook removes domain when addon is off');
+Capsule::table('tbldomains')->where('id', 44)->update(['emailforwarding' => 1]);
+
 echo "PASS $pass FAIL $fail\n";

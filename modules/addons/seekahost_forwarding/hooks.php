@@ -165,6 +165,16 @@ add_hook('AfterCronJob', 1, function ($vars) {
     }
 });
 
+// Email Forwarding addon turned off by the client or an admin: remove the domain from the server
+// within one cron run (rules are kept, so turning the addon on again restores them).
+add_hook('AfterCronJob', 2, function ($vars) {
+    try {
+        Service::suspendWithoutAddon();
+    } catch (\Throwable $e) {
+        Logger::log('cron', 'Addon check: ' . $e->getMessage(), 'error', null, null, 'system');
+    }
+});
+
 // Domain deleted in WHMCS: clean up server and module data (cron retries if the server is unreachable).
 add_hook('DomainDelete', 1, function ($vars) {
     try {

@@ -63,6 +63,7 @@ class Schema
                 $t->unsignedInteger('server_id')->nullable()->index();
                 $t->string('status', 20)->default('pending')->index();
                 $t->boolean('parked')->default(0);
+                $t->dateTime('parked_at')->nullable();
                 $t->text('remote_ref')->nullable();
                 $t->string('ssl_status', 20)->nullable();
                 $t->dateTime('ssl_requested_at')->nullable();
@@ -198,6 +199,9 @@ class Schema
         });
         $add(self::T_DOMAINS, 'parked', function ($t) {
             $t->boolean('parked')->default(0);
+        });
+        $add(self::T_DOMAINS, 'parked_at', function ($t) {
+            $t->dateTime('parked_at')->nullable();
         });
         $add(self::T_DOMAINS, 'ssl_requested_at', function ($t) {
             $t->dateTime('ssl_requested_at')->nullable();
