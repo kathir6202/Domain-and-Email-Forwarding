@@ -502,6 +502,24 @@ class Service
     }
 
     /**
+     * An admin saved the domain with the Email Forwarding addon switched off: remove it from the server now
+     * (rules kept). Only reacts to the addon; other reasons are left to the daily cron. @return bool removed
+     */
+    public static function suspendIfAddonOff($domainId)
+    {
+        $fwd = Capsule::table(Schema::T_DOMAINS)->where('domain_id', (int) $domainId)->first();
+        if (!$fwd || !in_array($fwd->status, ['active', 'error'], true)) {
+            return false;
+        }
+        list($ok, $reason, $code) = self::access(self::domainRow($fwd->domain_id));
+        if ($ok || $code !== 'addon') {
+            return false;
+        }
+        self::unprovision($fwd, 'suspended', $reason);
+        return true;
+    }
+
+    /**
      * Every cron run: a domain whose Email Forwarding addon was turned off (by the client or an admin) is removed
      * from the server. Its rules are kept, so turning the addon on again restores them (daily cron).
      */

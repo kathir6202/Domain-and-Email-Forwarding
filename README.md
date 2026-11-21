@@ -51,7 +51,8 @@ Supports WHMCS 8.13.x and 9.0.x on PHP 7.4 – 8.3. The client area works with t
   - removes **unused parked domains** from the server after *Remove Unused Parked Domains (days)* (default 60, 0 = never). The count starts when a domain is parked with nothing in use; for domains parked before version 1.5.0 it starts on the first daily cron run after the upgrade. Each removal is logged as `auto_unpark`.
   - restores domains that disappeared from the server
   - retries SSL
-- When the **Email Forwarding addon is turned off** (by the client or an admin), the domain and all its redirects and email forwarders are removed from the server at the next cron run (about 5 minutes). Its rules are kept in the module, so turning the addon on again restores them at the daily cron.
+- When the **Email Forwarding addon is turned off**, the domain and all its redirects and email forwarders are removed from the server. If an admin switches it off and clicks **Save Changes** on the domain page, this happens immediately. If the client turns it off, it happens at the next cron run (about 5 minutes), which is also the safety net if the immediate removal fails. Its rules are kept in the module, so turning the addon on again restores them at the daily cron.
+- When a domain is removed from a **cPanel** server, its folder `public_html/seekahost_fwd/<domain>` is deleted too (cPanel itself leaves addon-domain folders behind). Only the module's own folders are deleted, never a folder a domain used before an in-place migration. The folder is created again if the domain is set up again.
 - When a **hosting account** is created for a forwarded domain, the domain is first released from the forwarding server.
 - When a domain **moves to another client**, the previous owner's forwarders are wiped.
 - When a domain is **deleted** in WHMCS, it is removed from the server.

@@ -417,6 +417,18 @@ Service::saveUrl(fwdOf('a.com'), ['source_path' => '/shop', 'destination' => 'ht
 unset(FakeCpanel::$failOn['Fileman::get_file_content']);
 ok(http('a.com', '/shop') === [301, 'https://shop.example.org/'], 'normal deploy works even if reading .htaccess fails');
 
+// ---- 1.5.1: removing a domain deletes only this module's own folder
+$own = FakeCpanel::$home . '/public_html/seekahost_fwd/c.com';
+$orig = FakeCpanel::$home . '/public_html/olde';
+ok(is_dir($own) && is_dir($orig) && fwdOf('c.com')->status === 'active' && fwdOf('e.com')->status === 'active', 'folder test preconditions');
+Service::unprovision(fwdOf('c.com'), 'suspended', 'test');
+ok(!isset(FakeCpanel::$st['addon']['c.com']) && !is_dir($own), 'removal deletes the seekahost_fwd/<domain> folder');
+Service::unprovision(fwdOf('e.com'), 'suspended', 'test');
+ok(!isset(FakeCpanel::$st['addon']['e.com']) && is_dir($orig), 'in-place migrated domain: its original folder is never deleted');
+Service::provision(fwdOf('c.com'));
+ok(fwdOf('c.com')->status === 'active' && is_file($own . '/index.php'), 'set up again: folder and files re-created');
+Service::provision(fwdOf('e.com'));
+
 // ---- access mode switch
 Migrator::setAccessModeAll();
 ok(SeekaHost\Forwarding\Settings::get('access_mode') === 'all', 'access mode all');

@@ -378,4 +378,29 @@ foreach ($GLOBALS['hooks']['AfterCronJob'] as $hook) { $hook([]); }
 ok(fwdOf(44)->status === 'suspended' && !isset(FakePanel::$domains['addon1.com']), 'AfterCronJob hook removes domain when addon is off');
 Capsule::table('tbldomains')->where('id', 44)->update(['emailforwarding' => 1]);
 
+// ---- 1.5.1: instant removal when an admin saves the domain with the addon off
+Service::cron();
+ok(fwdOf(44)->status === 'active', 'addon1 restored before save test');
+Capsule::table('tbldomains')->where('id', 44)->update(['emailforwarding' => 0]);
+$GLOBALS['hooks']['DomainEdit'][0](['userid' => 1, 'domainid' => 44]);
+ok(fwdOf(44)->status === 'suspended' && !isset(FakePanel::$domains['addon1.com']), 'DomainEdit with addon off removes it at once');
+ok(Capsule::table(Schema::T_URL)->where('fwd_domain_id', fwdOf(44)->id)->count() === 1, 'rules kept after instant removal');
+$GLOBALS['hooks']['AdminClientDomainsTabFieldsSave'][0](['id' => 44, 'userid' => 1]);
+ok(fwdOf(44)->status === 'suspended', 'second hook point is a no-op');
+Capsule::table('tbldomains')->where('id', 44)->update(['emailforwarding' => 1]);
+Service::cron();
+Capsule::table('tbldomains')->where('id', 44)->update(['emailforwarding' => 0]);
+$GLOBALS['hooks']['AdminClientDomainsTabFieldsSave'][0](['id' => 44, 'userid' => 1]);
+ok(fwdOf(44)->status === 'suspended' && !isset(FakePanel::$domains['addon1.com']), 'AdminClientDomainsTabFieldsSave with addon off removes it at once');
+Capsule::table('tbldomains')->where('id', 44)->update(['emailforwarding' => 1]);
+Capsule::table('tbldomains')->where('id', 41)->update(['status' => 'Expired']);
+ok(Service::suspendIfAddonOff(41) === false && fwdOf(41)->status === 'active', 'save hook ignores reasons other than the addon (left to the daily cron)');
+Capsule::table('tbldomains')->where('id', 41)->update(['status' => 'Active']);
+FakePanel::$fail['removeDomain'] = 'server down';
+Capsule::table('tbldomains')->where('id', 41)->update(['emailforwarding' => 0]);
+$GLOBALS['hooks']['DomainEdit'][0](['userid' => 1, 'domainid' => 41]);
+ok(fwdOf(41)->status === 'active', 'failed instant removal never breaks the save; cron retries');
+unset(FakePanel::$fail['removeDomain']);
+Capsule::table('tbldomains')->where('id', 41)->update(['emailforwarding' => 1]);
+
 echo "PASS $pass FAIL $fail\n";

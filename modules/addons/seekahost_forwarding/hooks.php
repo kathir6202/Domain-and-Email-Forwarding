@@ -165,6 +165,21 @@ add_hook('AfterCronJob', 1, function ($vars) {
     }
 });
 
+// Admin saved a domain with the Email Forwarding addon switched off: remove it from the server right away
+// (both hook points are used; the second call finds nothing left to do). The cron below is the safety net.
+$shfwdAddonOff = function ($vars) {
+    $id = (int) (isset($vars['domainid']) ? $vars['domainid'] : (isset($vars['id']) ? $vars['id'] : 0));
+    try {
+        if ($id) {
+            Service::suspendIfAddonOff($id);
+        }
+    } catch (\Throwable $e) {
+        Logger::log('unprovision', 'Removing after the addon was switched off failed (the cron retries): ' . $e->getMessage(), 'error', null, $id ?: null);
+    }
+};
+add_hook('AdminClientDomainsTabFieldsSave', 1, $shfwdAddonOff);
+add_hook('DomainEdit', 1, $shfwdAddonOff);
+
 // Email Forwarding addon turned off by the client or an admin: remove the domain from the server
 // within one cron run (rules are kept, so turning the addon on again restores them).
 add_hook('AfterCronJob', 2, function ($vars) {

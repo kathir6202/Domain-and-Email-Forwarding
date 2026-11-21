@@ -647,7 +647,7 @@ class AdminController
         echo '<h2>' . self::e(Validator::toUnicode($fwd->domain)) . ' ' . $this->statusLabel($fwd->status)
             . ($fwd->parked ? ' <span class="label label-info badge badge-info">Parked</span>' : '') . '</h2>';
         if (!$eligible) {
-            echo '<div class="alert alert-warning">Client access: ' . self::e($reason) . ' (admins can still manage it; the daily cron removes ineligible domains from the server).</div>';
+            echo '<div class="alert alert-warning">Client access: ' . self::e($reason) . ' (admins can still manage it; ineligible domains are removed from the server by the cron: within about 5 minutes when the Email Forwarding addon is off, otherwise daily).</div>';
         }
         if ($policy['park_only']) {
             echo '<div class="alert alert-info">This TLD is configured as "park only".</div>';

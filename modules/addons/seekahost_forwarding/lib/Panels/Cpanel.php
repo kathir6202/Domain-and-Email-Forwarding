@@ -234,6 +234,37 @@ class Cpanel extends AbstractPanel
             $key = (self::labelOf($row) ?: (isset($ref['sub']) ? $ref['sub'] : '')) . '_' . $this->accountMainDomain();
         }
         $this->cpanel(2, 'AddonDomain', 'deladdondomain', ['domain' => $domain, 'subdomain' => $key]);
+        $this->deleteOwnFolder($domain, $row);
+    }
+
+    /**
+     * cPanel never deletes an addon domain's folder. Delete it only when it is this module's own folder
+     * (public_html/seekahost_fwd/<domain>), never a folder the domain used before (e.g. after an in-place migration).
+     * Best effort: the folder is re-created when the domain is set up again.
+     */
+    private function deleteOwnFolder($domain, array $row)
+    {
+        $home = $this->homeDir();
+        if (isset($row['reldir']) && $row['reldir'] !== '') {
+            $rel = preg_replace('#^home:/?#', '', (string) $row['reldir']);
+        } elseif (isset($row['dir']) && strpos((string) $row['dir'], $home . '/') === 0) {
+            $rel = substr((string) $row['dir'], strlen($home) + 1);
+        } else {
+            return;
+        }
+        $rel = trim($rel, '/');
+        $own = self::DOCROOT_BASE . '/' . strtolower($domain);
+        if (strtolower($rel) !== $own || strpos($domain, '/') !== false || strpos($domain, '..') !== false) {
+            return;
+        }
+        foreach (['unlink', 'trash'] as $op) {
+            try {
+                $this->cpanel(2, 'Fileman', 'fileop', ['op' => $op, 'sourcefiles' => $home . '/' . $rel, 'doubledecode' => 0]);
+                return;
+            } catch (\Throwable $e) {
+                // try the next way; a leftover folder is harmless
+            }
+        }
     }
 
     public function deployFiles($domain, array $ref, array $files)
